@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: twitch-video-gen
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: |
+      apt-get install -y ffmpeg libass-dev 2>/dev/null || true
+      pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --timeout 300 --workers 1
+    envVars:
+      - key: PEXELS_API_KEY
+        sync: false    # set this in Render dashboard
+    healthCheckPath: /health
+    autoDeploy: true
