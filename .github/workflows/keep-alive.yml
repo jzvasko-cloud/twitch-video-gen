@@ -2,12 +2,12 @@ name: Keep Render Service Warm
 
 on:
   schedule:
-      - cron: '*/10 * * * *'
-        workflow_dispatch:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
-        jobs:
-          ping:
-              runs-on: ubuntu-latest
-                  steps:
-                        - name: Ping Render service
-                                run: curl -s --max-time 120 https://twitch-video-gen.onrender.com/status/ping || true
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render service
+        run: curl -s --max-time 120 https://twitch-video-gen.onrender.com/status/ping || true
