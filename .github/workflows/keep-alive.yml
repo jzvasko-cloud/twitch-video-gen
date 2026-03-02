@@ -13,7 +13,7 @@ jobs:
         run: |
           for i in 1 2 3; do
             echo "Attempt $i..."
-            if curl -s --max-time 120 https://twitch-video-gen.onrender.com/health; then
+            if curl -s --max-time 500 https://twitch-video-gen.onrender.com/health; then
               echo "Service is warm!"
               exit 0
             fi
