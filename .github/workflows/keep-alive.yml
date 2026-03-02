@@ -10,8 +10,4 @@ on:
               runs-on: ubuntu-latest
                   steps:
                         - name: Ping Render service
-                                run: |
-                                          curl -s -o /dev/null -w "%{http_code} in %{time_total}s" \
-                                                      https://twitch-video-gen.onrender.com/status/ping \
-                                                                  --max-time 120 || true
-                                                                            echo " - ping complete"
+                                run: curl -s --max-time 120 https://twitch-video-gen.onrender.com/status/ping || true
