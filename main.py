@@ -208,6 +208,41 @@ def download(job_id):
         time.sleep(2)
     return jsonify({"error": "timeout waiting for video"}), 504
 
+@app.route("/tos")
+def tos():
+        return """<!DOCTYPE html><html><head><title>Terms of Service</title></head><body>
+        <h1>ClipLoreTV Auto-Post — Terms of Service</h1>
+        <p>This application is a private automation tool used solely by its owner to upload
+        video content to TikTok. It is not a public-facing service and has no end users
+        other than the developer. By using this tool you agree to TikTok's own Terms of
+        Service at https://www.tiktok.com/legal/terms-of-service.</p>
+        <p>Last updated: 2026-03-03</p>
+        </body></html>""", 200, {"Content-Type": "text/html"}
+
+
+@app.route("/privacy")
+def privacy():
+        return """<!DOCTYPE html><html><head><title>Privacy Policy</title></head><body>
+        <h1>ClipLoreTV Auto-Post — Privacy Policy</h1>
+        <p>This application is a private automation tool. It does not collect, store, or
+        share personal data from any users. The only data processed is video content
+        created by the tool owner and uploaded to TikTok on their behalf via the
+        TikTok Content Posting API.</p>
+        <p>TikTok access tokens are used solely to authenticate API requests and are
+        never logged or shared with third parties.</p>
+        <p>Last updated: 2026-03-03</p>
+        </body></html>""", 200, {"Content-Type": "text/html"}
+
+
+@app.route("/tiktok/callback")
+def tiktok_callback():
+        """OAuth2 callback — exchanges code for access token."""
+        code = request.args.get("code")
+        if not code:
+                    return jsonify({"error": "missing code"}), 400
+                # Store code temporarily so user can copy it
+    return jsonify({"message": "Authorization successful", "code": code}), 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
