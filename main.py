@@ -243,6 +243,11 @@ def tiktok_callback():
                 # Store code temporarily so user can copy it
     return jsonify({"message": "Authorization successful", "code": code}), 200
 
+@app.route("/tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt")
+def tiktok_verify():
+        return "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q", 200, {"Content-Type": "text/plain"}
+
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
