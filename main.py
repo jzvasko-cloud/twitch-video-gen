@@ -166,7 +166,7 @@ def status(job_id):
 
 @app.route("/generate", methods=["POST"])
 def generate():
-        data = request.get_json(force=True) or request.form.to_dict() or {}
+    data = request.get_json(force=True) or request.form.to_dict() or {}
     script = (data.get("script") or "").strip()
     topic = (data.get("topic") or "gaming").strip()
 
