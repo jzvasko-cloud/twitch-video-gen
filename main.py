@@ -5,7 +5,7 @@ Runs free on Render.com (512MB RAM limit).
 Flow: script + topic -> TTS audio -> FFmpeg (color bg + captions) -> MP4
 No Pexels download needed — uses ffmpeg built-in color source.
 """
-from flask import Flask, jsonify, send_file, request, abort
+from flask import Flask, jsonify, send_file, request, abort, make_response
 from gtts import gTTS
 import subprocess, json, os, uuid, threading, shutil, re, time
 
@@ -245,7 +245,12 @@ def tiktok_callback():
 
 @app.route("/tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt")
 def tiktok_verify():
-    return "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q", 200, {"Content-Type": "text/plain"}
+    body = "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q"
+    resp = make_response(body, 200)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Content-Length"] = str(len(body))
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
 
 
 
