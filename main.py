@@ -245,10 +245,4 @@ def tiktok_callback():
 
 @app.route("/tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt")
 def tiktok_verify():
-    body = b"tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q"
-    resp = make_response(body, 200)
-    resp.headers["Content-Type"] = "text/plain"
-    resp.headers["Content-Length"] = str(len(body))
-    resp.headers["Content-Encoding"] = "identity"
-    resp.headers["Cache-Control"] = "no-cache, no-store"
-    return resp
+    return "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q", 200, {"Content-Type": "text/plain; charset=utf-8"}
