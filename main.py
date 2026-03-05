@@ -2,7 +2,7 @@ import os
 import threading
 import time
 import urllib.request
-from flask import Flask
+from flask import Flask, send_from_directory
 
 app = Flask(__name__, static_url_path='', static_folder='static')
 
@@ -36,7 +36,7 @@ def health():
 
 @app.route("/tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt")
 def tiktok_verify():
-    return "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    return send_from_directory(app.static_folder, "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt", mimetype="text/plain")
 
 @app.route("/tos")
 def tos():
