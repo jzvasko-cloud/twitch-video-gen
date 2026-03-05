@@ -1,4 +1,4 @@
-h"""
+"""
 Twitch Content Pipeline — Video Generator Service
 Runs free on Render.com (512MB RAM limit).
 
