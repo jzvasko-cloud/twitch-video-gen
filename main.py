@@ -2,9 +2,9 @@ import os
 import threading
 import time
 import urllib.request
-from flask import Flask, send_from_directory
+from flask import Flask
 
-app = Flask(__name__, static_url_path='', static_folder='static')
+app = Flask(__name__)
 
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://twitch-video-gen.onrender.com")
 
@@ -36,7 +36,7 @@ def health():
 
 @app.route("/tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt")
 def tiktok_verify():
-    return send_from_directory(app.static_folder, "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt", mimetype="text/plain")
+    return "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.route("/tos")
 def tos():
