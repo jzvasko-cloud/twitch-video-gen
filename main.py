@@ -36,7 +36,7 @@ def health():
 
 @app.route("/tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q.txt")
 def tiktok_verify():
-    return "tiktokgf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q\n", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    return "tiktok-developers-site-verification=gf5YuUb7tBa2vRZZ306I0dDfa1eCsk2Q", 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.route("/tos")
 def tos():
