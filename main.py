@@ -2,11 +2,13 @@ import os
 import threading
 import time
 import urllib.request
-from flask import Flask, make_response
+from flask import Flask
 
 app = Flask(__name__, static_url_path='', static_folder='static')
 
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://twitch-video-gen.onrender.com")
+
+_keep_alive_started = False
 
 def keep_alive():
     """Ping ourselves every 5 minutes to prevent Render free-tier spin-down."""
@@ -17,7 +19,12 @@ def keep_alive():
         except Exception:
             pass
 
-threading.Thread(target=keep_alive, daemon=True).start()
+@app.before_request
+def _start_keep_alive():
+    global _keep_alive_started
+    if not _keep_alive_started:
+        _keep_alive_started = True
+        threading.Thread(target=keep_alive, daemon=True).start()
 
 @app.route("/")
 def home():
