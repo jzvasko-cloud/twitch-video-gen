@@ -1,4 +1,4 @@
-"""
+h"""
 Twitch Content Pipeline — Video Generator Service
 Runs free on Render.com (512MB RAM limit).
 
@@ -9,7 +9,7 @@ from flask import Flask, jsonify, send_file, request, abort, make_response
 from gtts import gTTS
 import subprocess, json, os, uuid, threading, shutil, re, time
 
-app = Flask(__name__)
+app = Flask(__name__, static_url_path='', static_folder='static')
 
 OUTPUT_DIR = "/tmp/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
