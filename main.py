@@ -2,6 +2,7 @@
 ClipLoreTV Auto-Post Service
 Flask backend for automated Twitch clip → TikTok video pipeline.
 Endpoints: /generate-script, /fetch-clips, /assemble-video, /post-to-tiktok
+           /tiktok/auth, /tiktok/callback, /tiktok/status
 """
 
 import os
@@ -15,7 +16,7 @@ import uuid
 from pathlib import Path
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from gtts import gTTS
 
 app = Flask(__name__)
@@ -29,9 +30,18 @@ TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+TIKTOK_REDIRECT_URI = f"{os.environ.get('RENDER_EXTERNAL_URL', 'https://twitch-video-gen.onrender.com')}/tiktok/callback"
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "cliplore"
 TEMP_DIR.mkdir(exist_ok=True)
+
+# In-memory TikTok user token store (survives until next deploy)
+_tiktok_token_store = {
+    "access_token": None,
+    "refresh_token": None,
+    "expires_at": 0,
+    "open_id": None,
+}
 
 # ---------------------------------------------------------------------------
 # Keep-alive (Render free tier spin-down prevention)
@@ -117,6 +127,188 @@ No analytics or tracking services are used.</p>
 <h2>Contact</h2>
 <p>For privacy questions, contact the developer via the TikTok developer portal.</p>
 </body></html>"""
+
+
+# ===================================================================
+#  TikTok Login Kit OAuth Flow
+# ===================================================================
+TIKTOK_SCOPES = "user.info.basic,video.publish,video.upload"
+
+
+@app.route("/tiktok/auth")
+def tiktok_auth():
+    """Redirect to TikTok authorization page.
+
+    Visit this URL in your browser to start the OAuth flow.
+    TikTok will redirect back to /tiktok/callback with an auth code.
+    """
+    import hashlib
+    import secrets
+
+    # CSRF state token
+    state = secrets.token_urlsafe(16)
+    # PKCE code verifier + challenge
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        hashlib.sha256(code_verifier.encode())
+        .digest()
+    )
+    import base64
+    code_challenge_b64 = base64.urlsafe_b64encode(code_challenge).rstrip(b"=").decode()
+
+    # Store verifier in a cookie so callback can use it
+    auth_url = (
+        "https://www.tiktok.com/v2/auth/authorize/"
+        f"?client_key={TIKTOK_CLIENT_KEY}"
+        f"&scope={TIKTOK_SCOPES}"
+        f"&response_type=code"
+        f"&redirect_uri={TIKTOK_REDIRECT_URI}"
+        f"&state={state}"
+        f"&code_challenge={code_challenge_b64}"
+        f"&code_challenge_method=S256"
+    )
+
+    resp = redirect(auth_url)
+    resp.set_cookie("tiktok_state", state, httponly=True, samesite="Lax", max_age=600)
+    resp.set_cookie("tiktok_verifier", code_verifier, httponly=True, samesite="Lax", max_age=600)
+    return resp
+
+
+@app.route("/tiktok/callback")
+def tiktok_callback():
+    """Handle TikTok OAuth callback — exchange auth code for access token."""
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    error = request.args.get("error", "")
+
+    if error:
+        return jsonify({"error": error, "description": request.args.get("error_description", "")}), 400
+
+    # Validate CSRF state
+    saved_state = request.cookies.get("tiktok_state", "")
+    if not state or state != saved_state:
+        return jsonify({"error": "State mismatch — possible CSRF. Try /tiktok/auth again."}), 403
+
+    code_verifier = request.cookies.get("tiktok_verifier", "")
+
+    # Exchange code for token
+    try:
+        token_resp = requests.post(
+            "https://open.tiktokapis.com/v2/oauth/token/",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "client_key": TIKTOK_CLIENT_KEY,
+                "client_secret": TIKTOK_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": TIKTOK_REDIRECT_URI,
+                "code_verifier": code_verifier,
+            },
+            timeout=15,
+        )
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+
+        if "access_token" not in token_data:
+            return jsonify({"error": "No access_token in response", "raw": token_data}), 502
+
+        # Store tokens
+        _tiktok_token_store["access_token"] = token_data["access_token"]
+        _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", "")
+        _tiktok_token_store["expires_at"] = time.time() + token_data.get("expires_in", 86400)
+        _tiktok_token_store["open_id"] = token_data.get("open_id", "")
+
+        return """<!DOCTYPE html>
+<html><head><title>ClipLoreTV — TikTok Connected</title></head>
+<body style="font-family:system-ui;max-width:600px;margin:80px auto;text-align:center">
+<h1>TikTok Connected!</h1>
+<p>Access token stored. You can now use <code>/pipeline</code> without manually passing a token.</p>
+<p>Token expires in """ + str(token_data.get("expires_in", 0) // 3600) + """ hours.</p>
+<p><a href="/tiktok/status">Check token status</a></p>
+</body></html>"""
+
+    except requests.RequestException as e:
+        return jsonify({"error": f"Token exchange failed: {str(e)}"}), 502
+
+
+@app.route("/tiktok/refresh", methods=["POST"])
+def tiktok_refresh():
+    """Refresh the TikTok access token using the stored refresh token."""
+    refresh_token = _tiktok_token_store.get("refresh_token", "")
+    if not refresh_token:
+        return jsonify({"error": "No refresh token stored. Visit /tiktok/auth first."}), 400
+
+    try:
+        resp = requests.post(
+            "https://open.tiktokapis.com/v2/oauth/token/",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "client_key": TIKTOK_CLIENT_KEY,
+                "client_secret": TIKTOK_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        token_data = resp.json()
+
+        if "access_token" not in token_data:
+            return jsonify({"error": "Refresh failed", "raw": token_data}), 502
+
+        _tiktok_token_store["access_token"] = token_data["access_token"]
+        _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", refresh_token)
+        _tiktok_token_store["expires_at"] = time.time() + token_data.get("expires_in", 86400)
+
+        return jsonify({"status": "refreshed", "expires_in": token_data.get("expires_in", 0)})
+    except requests.RequestException as e:
+        return jsonify({"error": f"Refresh failed: {str(e)}"}), 502
+
+
+@app.route("/tiktok/status")
+def tiktok_status():
+    """Check whether a TikTok token is stored and still valid."""
+    token = _tiktok_token_store.get("access_token")
+    if not token:
+        return jsonify({"authenticated": False, "message": "No token. Visit /tiktok/auth to connect."})
+
+    remaining = _tiktok_token_store["expires_at"] - time.time()
+    return jsonify({
+        "authenticated": True,
+        "open_id": _tiktok_token_store.get("open_id", ""),
+        "expires_in_seconds": max(0, int(remaining)),
+        "expired": remaining <= 0,
+    })
+
+
+def _get_tiktok_token():
+    """Get the stored TikTok user access token, auto-refreshing if needed."""
+    remaining = _tiktok_token_store["expires_at"] - time.time()
+
+    # If expired but we have a refresh token, try refreshing
+    if remaining <= 60 and _tiktok_token_store.get("refresh_token"):
+        try:
+            resp = requests.post(
+                "https://open.tiktokapis.com/v2/oauth/token/",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "client_key": TIKTOK_CLIENT_KEY,
+                    "client_secret": TIKTOK_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": _tiktok_token_store["refresh_token"],
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            td = resp.json()
+            if "access_token" in td:
+                _tiktok_token_store["access_token"] = td["access_token"]
+                _tiktok_token_store["refresh_token"] = td.get("refresh_token", _tiktok_token_store["refresh_token"])
+                _tiktok_token_store["expires_at"] = time.time() + td.get("expires_in", 86400)
+        except Exception:
+            pass  # fall through — caller will get the stale token or None
+
+    return _tiktok_token_store.get("access_token")
 
 
 # ===================================================================
@@ -239,7 +431,7 @@ def _get_twitch_token():
     return data["access_token"]
 
 
-def _get_broadcaster_id(login):
+def _get_broadcaster_id(login: str) -> str:
     """Resolve a Twitch login name to broadcaster ID."""
     token = _get_twitch_token()
     resp = requests.get(
@@ -294,6 +486,7 @@ def fetch_clips():
                 )
                 resp.raise_for_status()
                 for clip in resp.json().get("data", []):
+                    # Build download URL from thumbnail
                     thumb = clip.get("thumbnail_url", "")
                     download_url = thumb.split("-preview-")[0] + ".mp4" if "-preview-" in thumb else ""
                     all_clips.append(
@@ -323,10 +516,15 @@ def assemble_video():
     """Assemble a TikTok-ready video from script + clips.
 
     JSON body:
-      script (str, required): The voiceover script text.
-      clip_urls (list[str], required): Direct MP4 URLs of Twitch clips.
+      script (str, required): The voiceover script text (strip [VISUAL]/[PAUSE] tags before sending, or they'll be auto-stripped).
+      clip_urls (list[str], required): Direct MP4 URLs of Twitch clips to use as footage.
     Returns:
       { video_path: str, duration: float }
+
+    The assembled video is 1080x1920 (9:16), 30fps, with:
+      - Concatenated clip footage scaled/cropped to vertical
+      - gTTS voiceover layered on top
+      - Clip footage trimmed to match voiceover length
     """
     data = request.get_json(force=True)
     script = data.get("script", "")
@@ -340,6 +538,7 @@ def assemble_video():
     job_dir.mkdir(exist_ok=True)
 
     try:
+        # --- 1. Clean script (strip [VISUAL:...], [PAUSE ...], [HOOK], [BUILD], [PAYOFF], [CTA] tags) ---
         import re
 
         clean_script = re.sub(r"\[VISUAL:[^\]]*\]", "", script)
@@ -347,10 +546,12 @@ def assemble_video():
         clean_script = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", clean_script)
         clean_script = re.sub(r"\n{3,}", "\n\n", clean_script).strip()
 
+        # --- 2. Generate TTS audio ---
         tts_path = job_dir / "voiceover.mp3"
-        tts = gTTS(text=clean_script, lang="en", tld="co.uk")
+        tts = gTTS(text=clean_script, lang="en", tld="co.uk")  # British accent sounds good for commentary
         tts.save(str(tts_path))
 
+        # Get voiceover duration
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "quiet", "-print_format", "json",
@@ -360,8 +561,9 @@ def assemble_video():
         )
         vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
 
+        # --- 3. Download clips ---
         clip_paths = []
-        for i, url in enumerate(clip_urls[:5]):
+        for i, url in enumerate(clip_urls[:5]):  # cap at 5 clips
             clip_path = job_dir / f"clip_{i}.mp4"
             try:
                 r = requests.get(url, timeout=30, stream=True)
@@ -376,6 +578,7 @@ def assemble_video():
         if not clip_paths:
             return jsonify({"error": "Could not download any clips"}), 400
 
+        # --- 4. Scale each clip to 1080x1920 (9:16) and loop/trim to fill voiceover ---
         scaled_clips = []
         for i, cp in enumerate(clip_paths):
             scaled = job_dir / f"scaled_{i}.mp4"
@@ -384,8 +587,8 @@ def assemble_video():
                     "ffmpeg", "-y", "-i", str(cp),
                     "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                    "-an",
-                    "-t", str(vo_duration / len(clip_paths) + 1),
+                    "-an",  # strip audio — we'll use TTS
+                    "-t", str(vo_duration / len(clip_paths) + 1),  # each clip gets equal share + 1s buffer
                     str(scaled),
                 ],
                 capture_output=True, timeout=120,
@@ -396,6 +599,7 @@ def assemble_video():
         if not scaled_clips:
             return jsonify({"error": "FFmpeg scaling failed"}), 500
 
+        # --- 5. Concatenate scaled clips ---
         concat_list = job_dir / "concat.txt"
         with open(concat_list, "w") as f:
             for sc in scaled_clips:
@@ -412,6 +616,7 @@ def assemble_video():
             capture_output=True, timeout=120,
         )
 
+        # --- 6. Merge video + voiceover ---
         final_video = job_dir / "final.mp4"
         subprocess.run(
             [
@@ -453,14 +658,21 @@ def post_to_tiktok():
       description (str, optional): Caption/description with hashtags.
     Returns:
       { publish_id: str, status: str }
+
+    NOTE: TikTok Content Posting API uses a two-step upload:
+      1. Initialize upload → get upload_url
+      2. PUT video bytes to upload_url
+      3. Publish with description
     """
     data = request.get_json(force=True)
     video_path = data.get("video_path", "")
-    access_token = data.get("access_token", "")
+    access_token = data.get("access_token", "") or _get_tiktok_token()
     description = data.get("description", "")
 
-    if not video_path or not access_token:
-        return jsonify({"error": "video_path and access_token are required"}), 400
+    if not video_path:
+        return jsonify({"error": "video_path is required"}), 400
+    if not access_token:
+        return jsonify({"error": "No access_token provided and no stored token. Visit /tiktok/auth first."}), 401
 
     video_file = Path(video_path)
     if not video_file.exists():
@@ -469,6 +681,7 @@ def post_to_tiktok():
     file_size = video_file.stat().st_size
 
     try:
+        # --- Step 1: Initialize upload ---
         init_resp = requests.post(
             "https://open.tiktokapis.com/v2/post/publish/video/init/",
             headers={
@@ -486,7 +699,7 @@ def post_to_tiktok():
                 "source_info": {
                     "source": "FILE_UPLOAD",
                     "video_size": file_size,
-                    "chunk_size": file_size,
+                    "chunk_size": file_size,  # single-chunk upload
                     "total_chunk_count": 1,
                 },
             },
@@ -501,6 +714,7 @@ def post_to_tiktok():
         upload_url = init_data["data"]["upload_url"]
         publish_id = init_data["data"]["publish_id"]
 
+        # --- Step 2: Upload video bytes ---
         with open(video_file, "rb") as vf:
             video_bytes = vf.read()
 
@@ -530,7 +744,7 @@ def post_to_tiktok():
 # ===================================================================
 @app.route("/pipeline", methods=["POST"])
 def pipeline():
-    """Run the full pipeline: topic -> script -> clips -> video -> TikTok post.
+    """Run the full pipeline: topic → script → clips → video → TikTok post.
 
     JSON body:
       topic (str, required): Topic for the script.
@@ -545,11 +759,13 @@ def pipeline():
     topic = data.get("topic", "")
     pillar = data.get("pillar", "")
     streamers = data.get("streamers", [])
-    tiktok_token = data.get("tiktok_access_token", "")
+    tiktok_token = data.get("tiktok_access_token", "") or _get_tiktok_token()
     description = data.get("description", "")
 
-    if not topic or not streamers or not tiktok_token:
-        return jsonify({"error": "topic, streamers, and tiktok_access_token are required"}), 400
+    if not topic or not streamers:
+        return jsonify({"error": "topic and streamers are required"}), 400
+    if not tiktok_token:
+        return jsonify({"error": "No tiktok_access_token provided and no stored token. Visit /tiktok/auth first."}), 401
 
     results = {"steps": {}}
 
@@ -621,6 +837,7 @@ def pipeline():
         job_dir = TEMP_DIR / job_id
         job_dir.mkdir(exist_ok=True)
 
+        # TTS
         tts_path = job_dir / "voiceover.mp3"
         tts = gTTS(text=clean, lang="en", tld="co.uk")
         tts.save(str(tts_path))
@@ -631,6 +848,7 @@ def pipeline():
         )
         vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
 
+        # Download clips
         clip_paths = []
         for i, url in enumerate(clip_urls[:5]):
             cp = job_dir / f"clip_{i}.mp4"
@@ -644,6 +862,7 @@ def pipeline():
             except Exception:
                 continue
 
+        # Scale clips
         scaled = []
         for i, cp in enumerate(clip_paths):
             sp = job_dir / f"scaled_{i}.mp4"
@@ -660,6 +879,7 @@ def pipeline():
             if sp.exists():
                 scaled.append(sp)
 
+        # Concat
         concat_list = job_dir / "concat.txt"
         with open(concat_list, "w") as f:
             for s in scaled:
@@ -672,6 +892,7 @@ def pipeline():
             capture_output=True, timeout=120,
         )
 
+        # Merge
         final = job_dir / "final.mp4"
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
