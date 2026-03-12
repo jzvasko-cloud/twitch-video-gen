@@ -392,6 +392,8 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
         },
         timeout=30,
     )
+    if resp.status_code != 200:
+        log.error("Anthropic API error %s: %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     return resp.json()["content"][0]["text"]
 
