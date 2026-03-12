@@ -1,8 +1,6 @@
 """
 ClipLoreTV Auto-Post Service
-Flask backend for automated Twitch clip → TikTok video pipeline.
-Endpoints: /generate-script, /fetch-clips, /assemble-video, /post-to-tiktok
-           /tiktok/auth, /tiktok/callback, /tiktok/status
+Flask backend for automated Twitch clip -> TikTok video pipeline.
 """
 
 import os
@@ -17,6 +15,10 @@ import uuid
 import functools
 import re
 import shutil
+import random
+import hashlib
+import secrets
+import base64
 from pathlib import Path
 
 import requests
@@ -26,12 +28,9 @@ from gtts import gTTS
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Logging — structured, no secrets
+# Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cliplore")
 
 # ---------------------------------------------------------------------------
@@ -43,46 +42,48 @@ TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-TIKTOK_REDIRECT_URI = f"{os.environ.get('RENDER_EXTERNAL_URL', 'https://twitch-video-gen.onrender.com')}/tiktok/callback"
-
-# API key for protecting POST endpoints — set in Render env vars
+TIKTOK_REDIRECT_URI = f"{SELF_URL}/tiktok/callback"
 API_SECRET = os.environ.get("CLIPLORE_API_SECRET", "")
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
-# Request size limit: 50 MB (mostly video data)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "cliplore"
 TEMP_DIR.mkdir(exist_ok=True)
-
-# Max temp disk usage before cleanup (500 MB)
 MAX_TEMP_BYTES = 500 * 1024 * 1024
 
+TIKTOK_SCOPES = "user.info.basic,video.publish,video.upload"
+
+PILLAR_PREFIXES = {
+    "tier_list": "Write a tier list script ranking ",
+    "hot_take": "Write a hot take script about ",
+    "nostalgia": "Write a nostalgia script comparing ",
+    "accountability": "Write an accountability script about ",
+    "rise_and_fall": "Write a rise-and-fall script about ",
+}
+VALID_PILLARS = set(PILLAR_PREFIXES.keys()) | {""}
+
+DEFAULT_STREAMERS = ["xqc", "pokimane", "asmongold", "hasanabi", "shroud", "nickmercs", "timthetatman"]
+
 # ---------------------------------------------------------------------------
-# TikTok token store — persisted to disk so tokens survive spin-down/restart
-# (Only lost on a fresh deploy — re-auth via /tiktok/auth after deploys)
+# TikTok token store (persisted to disk)
 # ---------------------------------------------------------------------------
 TOKEN_FILE = TEMP_DIR / "tiktok_tokens.json"
 
 
 def _load_tokens() -> dict:
-    """Load TikTok tokens from disk."""
     default = {"access_token": None, "refresh_token": None, "expires_at": 0, "open_id": None}
     try:
         if TOKEN_FILE.exists():
-            with open(TOKEN_FILE, "r") as f:
-                stored = json.load(f)
-            # Merge with defaults so missing keys don't crash
-            default.update(stored)
+            default.update(json.loads(TOKEN_FILE.read_text()))
     except Exception as e:
         log.warning("Failed to load token file: %s", e)
     return default
 
 
 def _save_tokens():
-    """Persist current TikTok tokens to disk."""
     try:
-        with open(TOKEN_FILE, "w") as f:
-            json.dump(_tiktok_token_store, f)
+        TOKEN_FILE.write_text(json.dumps(_tiktok_token_store))
     except Exception as e:
         log.warning("Failed to save token file: %s", e)
 
@@ -90,59 +91,16 @@ def _save_tokens():
 _tiktok_token_store = _load_tokens()
 
 # ---------------------------------------------------------------------------
-# Security: Rate limiting (in-memory, per-IP)
+# Security helpers
 # ---------------------------------------------------------------------------
-_rate_store: dict = {}  # ip -> [timestamps]
-RATE_LIMIT = 30         # requests per window
-RATE_WINDOW = 60        # seconds
+_rate_store: dict = {}
+RATE_LIMIT = 30
+RATE_WINDOW = 60
 
-
-def _check_rate_limit():
-    """Return True if caller exceeds rate limit."""
-    ip = request.remote_addr or "unknown"
-    now = time.time()
-    hits = _rate_store.get(ip, [])
-    hits = [t for t in hits if now - t < RATE_WINDOW]
-    if len(hits) >= RATE_LIMIT:
-        return True
-    hits.append(now)
-    _rate_store[ip] = hits
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Security: API key auth decorator for POST endpoints
-# ---------------------------------------------------------------------------
-def require_api_key(f):
-    """Decorator — rejects POST requests that don't carry the correct API key.
-
-    Key can be passed as:
-      - Header:  X-Api-Key: <secret>
-      - JSON body field:  api_key: <secret>
-    If CLIPLORE_API_SECRET env var is empty, auth is disabled (dev mode).
-    """
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        if not API_SECRET:
-            return f(*args, **kwargs)  # auth disabled
-        key = request.headers.get("X-Api-Key", "")
-        if not key and request.is_json:
-            key = (request.get_json(silent=True) or {}).get("api_key", "")
-        if key != API_SECRET:
-            log.warning("Unauthorized request to %s from %s", request.path, request.remote_addr)
-            return jsonify({"error": "Unauthorized — invalid or missing API key"}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-
-# ---------------------------------------------------------------------------
-# Security: Sanitize error messages (strip secrets)
-# ---------------------------------------------------------------------------
 _SECRET_PATTERNS: list = []
 
 
 def _build_secret_patterns():
-    """Build regex patterns to scrub from error messages."""
     for val in [ANTHROPIC_API_KEY, TWITCH_CLIENT_SECRET, TIKTOK_CLIENT_SECRET, API_SECRET]:
         if val and len(val) > 4:
             _SECRET_PATTERNS.append(re.compile(re.escape(val)))
@@ -152,28 +110,30 @@ _build_secret_patterns()
 
 
 def _sanitize(msg: str) -> str:
-    """Remove any leaked secrets from a string."""
     for pat in _SECRET_PATTERNS:
         msg = pat.sub("[REDACTED]", msg)
     return msg
 
 
-# ---------------------------------------------------------------------------
-# Security: Path traversal protection
-# ---------------------------------------------------------------------------
+def _check_rate_limit():
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    hits = [t for t in _rate_store.get(ip, []) if now - t < RATE_WINDOW]
+    if len(hits) >= RATE_LIMIT:
+        return True
+    hits.append(now)
+    _rate_store[ip] = hits
+    return False
+
+
 def _safe_path(user_path: str) -> Path:
-    """Resolve a user-supplied path and ensure it's inside TEMP_DIR."""
     resolved = Path(user_path).resolve()
     if not str(resolved).startswith(str(TEMP_DIR.resolve())):
         abort(400, description="Invalid file path")
     return resolved
 
 
-# ---------------------------------------------------------------------------
-# Security: Temp directory cleanup
-# ---------------------------------------------------------------------------
 def _cleanup_temp():
-    """Delete oldest job dirs if TEMP_DIR exceeds MAX_TEMP_BYTES."""
     try:
         total = sum(f.stat().st_size for f in TEMP_DIR.rglob("*") if f.is_file())
         if total <= MAX_TEMP_BYTES:
@@ -193,12 +153,26 @@ def _cleanup_temp():
         log.warning("Temp cleanup error: %s", e)
 
 
+def require_api_key(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not API_SECRET:
+            return f(*args, **kwargs)
+        key = request.headers.get("X-Api-Key", "")
+        if not key and request.is_json:
+            key = (request.get_json(silent=True) or {}).get("api_key", "")
+        if key != API_SECRET:
+            log.warning("Unauthorized request to %s from %s", request.path, request.remote_addr)
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
 # ---------------------------------------------------------------------------
-# Security: Global before/after request hooks
+# Request hooks
 # ---------------------------------------------------------------------------
 @app.before_request
 def _security_checks():
-    """Run on every request: rate limit, log."""
     if _check_rate_limit():
         return jsonify({"error": "Rate limit exceeded. Try again later."}), 429
     log.info("%s %s from %s", request.method, request.path, request.remote_addr)
@@ -206,14 +180,12 @@ def _security_checks():
 
 @app.after_request
 def _security_headers(response):
-    """Add security headers to every response."""
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'unsafe-inline'"
-    # CORS — restrict to own origin (adjust if you add a frontend)
     origin = request.headers.get("Origin", "")
     allowed_origins = {SELF_URL, "https://twitch-video-gen.onrender.com"}
     if origin in allowed_origins:
@@ -227,35 +199,400 @@ def _security_headers(response):
 def _too_large(e):
     return jsonify({"error": "Request too large (max 50 MB)"}), 413
 
+
 # ---------------------------------------------------------------------------
 # Keep-alive (Render free tier spin-down prevention)
 # ---------------------------------------------------------------------------
 _keep_alive_started = False
 
 
-def keep_alive():
-    while True:
-        time.sleep(300)
-        try:
-            urllib.request.urlopen(f"{SELF_URL}/health", timeout=10)
-        except Exception:
-            pass
-
-
 def _start_keep_alive():
     global _keep_alive_started
-    if not _keep_alive_started:
-        _keep_alive_started = True
-        threading.Thread(target=keep_alive, daemon=True).start()
+    if _keep_alive_started:
+        return
+    _keep_alive_started = True
+
+    def ping():
+        while True:
+            time.sleep(300)
+            try:
+                urllib.request.urlopen(f"{SELF_URL}/health", timeout=10)
+            except Exception:
+                pass
+
+    threading.Thread(target=ping, daemon=True).start()
 
 
-# Start keep-alive on first import (not as before_request to avoid conflict)
 _start_keep_alive()
 
 
-# ---------------------------------------------------------------------------
-# Static / utility routes
-# ---------------------------------------------------------------------------
+# ===================================================================
+#  System prompt for script generation
+# ===================================================================
+CLIPLORE_SYSTEM_PROMPT = """You are a short-form video scriptwriter for ClipLoreTV, a TikTok channel that posts AI-narrated gaming highlight commentary over Twitch clip footage. Your scripts are engineered for maximum watch-through rate, comments, and shares on TikTok.
+
+SCRIPT STRUCTURE (strict — follow every time):
+
+[HOOK] — First 3 seconds. The single most controversial, shocking, or curiosity-gap statement in the entire script. This line determines whether 90% of viewers stay or leave. Must create an immediate urge to keep watching OR to comment in disagreement.
+
+[VISUAL: describe what clip footage should show during this section]
+
+[BUILD] — Next 15-20 seconds. 3-4 rapid-fire beats that escalate the tension or argument. Each beat is 1-2 sentences max. Use pattern interrupts between beats:
+  - Pattern interrupt options: rhetorical question, "but here's the thing," dramatic pause cue "[PAUSE 0.5s]", tone shift, or direct audience challenge
+
+[VISUAL: describe clip footage for each beat]
+
+[PAYOFF] — Next 10-15 seconds. Deliver the main point, reveal, or ranking. This is where you cash the check the hook wrote. Be specific — names, events, data.
+
+[VISUAL: describe the key clip moment that matches the payoff]
+
+[CTA] — Final 5 seconds. Comment bait that splits the audience. Never generic. Always force a choice:
+  - "S tier or D tier? Comment now."
+  - "Who was actually right? Drop a name."
+  - "Am I wrong? Prove it below."
+
+VOICE RULES:
+- Total length: 120-180 words (40-60 second TikTok)
+- Tone: confident, slightly cocky, like a friend who watches too much Twitch
+- No "Hey guys," no "Welcome back," no intro fluff — open cold
+- Short sentences. Punchy. Never more than 15 words per sentence.
+- State opinions as facts. "The truth is..." not "I think..."
+- Use present tense for drama: "He walks on stage and the chat goes insane"
+- Reference specific moments, usernames, or events — never be vague
+
+OUTPUT FORMAT:
+Return ONLY the script text. Include [VISUAL] tags inline. Include [PAUSE] tags where dramatic pauses should go. No headers, no notes, no meta-commentary."""
+
+
+# ===================================================================
+#  Core logic — reusable functions (no Flask request dependency)
+# ===================================================================
+
+def generate_script_text(topic: str, pillar: str = "") -> str:
+    """Call Claude to generate a TikTok commentary script."""
+    user_msg = PILLAR_PREFIXES.get(pillar, "") + topic
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "system": CLIPLORE_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_msg}],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"]
+
+
+def clean_script(raw: str) -> str:
+    """Strip [VISUAL], [PAUSE], [HOOK], etc. tags from a script."""
+    text = re.sub(r"\[VISUAL:[^\]]*\]", "", raw)
+    text = re.sub(r"\[PAUSE[^\]]*\]", "", text)
+    text = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def fetch_clip_urls(streamers: list, count: int = 3) -> list:
+    """Fetch Twitch clip download URLs for the given streamers."""
+    token = _get_twitch_token()
+    urls = []
+    for streamer in streamers:
+        try:
+            bid = _get_broadcaster_id(streamer)
+            resp = requests.get(
+                "https://api.twitch.tv/helix/clips",
+                headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
+                params={"broadcaster_id": bid, "first": count},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            for clip in resp.json().get("data", []):
+                thumb = clip.get("thumbnail_url", "")
+                if "-preview-" in thumb:
+                    urls.append(thumb.split("-preview-")[0] + ".mp4")
+        except Exception:
+            continue
+    return urls
+
+
+def assemble_video_from_parts(script_text: str, clip_urls: list) -> tuple:
+    """Download clips, generate TTS, assemble 9:16 video. Returns (video_path, duration)."""
+    _cleanup_temp()
+
+    job_id = uuid.uuid4().hex[:10]
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(exist_ok=True)
+
+    # TTS voiceover
+    tts_path = job_dir / "voiceover.mp3"
+    tts = gTTS(text=clean_script(script_text), lang="en", tld="co.uk")
+    tts.save(str(tts_path))
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(tts_path)],
+        capture_output=True, text=True, timeout=15,
+    )
+    vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
+
+    # Download clips
+    clip_paths = []
+    for i, url in enumerate(clip_urls[:5]):
+        cp = job_dir / f"clip_{i}.mp4"
+        try:
+            r = requests.get(url, timeout=30, stream=True)
+            r.raise_for_status()
+            with open(cp, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
+            clip_paths.append(cp)
+        except Exception:
+            continue
+
+    if not clip_paths:
+        raise ValueError("Could not download any clips")
+
+    # Scale each clip to 1080x1920 (9:16)
+    scaled = []
+    per_clip = vo_duration / max(len(clip_paths), 1) + 1
+    for i, cp in enumerate(clip_paths):
+        sp = job_dir / f"scaled_{i}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(cp),
+                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an",
+                "-t", str(per_clip),
+                str(sp),
+            ],
+            capture_output=True, timeout=120,
+        )
+        if sp.exists():
+            scaled.append(sp)
+
+    if not scaled:
+        raise ValueError("FFmpeg scaling failed")
+
+    # Concatenate
+    concat_list = job_dir / "concat.txt"
+    concat_list.write_text("".join(f"file '{s}'\n" for s in scaled))
+
+    concat_vid = job_dir / "concat.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+         "-c", "copy", "-t", str(vo_duration), str(concat_vid)],
+        capture_output=True, timeout=120,
+    )
+
+    # Merge video + voiceover
+    final = job_dir / "final.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
+         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+         str(final)],
+        capture_output=True, timeout=120,
+    )
+
+    if not final.exists():
+        raise ValueError("Final video assembly failed")
+
+    return final, vo_duration
+
+
+def upload_to_tiktok(video_path: Path, access_token: str, description: str = "") -> str:
+    """Upload video to TikTok. Returns publish_id."""
+    file_size = video_path.stat().st_size
+    if file_size > 50 * 1024 * 1024:
+        raise ValueError("Video too large (max 50 MB)")
+
+    init_resp = requests.post(
+        "https://open.tiktokapis.com/v2/post/publish/video/init/",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+        },
+        json={
+            "post_info": {
+                "title": (description[:150]) if description else "ClipLoreTV",
+                "privacy_level": "PUBLIC_TO_EVERYONE",
+                "disable_duet": False,
+                "disable_comment": False,
+                "disable_stitch": False,
+            },
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": file_size,
+                "chunk_size": file_size,
+                "total_chunk_count": 1,
+            },
+        },
+        timeout=30,
+    )
+    init_resp.raise_for_status()
+    init_data = init_resp.json()
+
+    if init_data.get("error", {}).get("code") != "ok":
+        raise ValueError(f"TikTok init failed: {init_data}")
+
+    upload_url = init_data["data"]["upload_url"]
+    publish_id = init_data["data"]["publish_id"]
+
+    video_bytes = video_path.read_bytes()
+    requests.put(
+        upload_url,
+        headers={
+            "Content-Type": "video/mp4",
+            "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
+        },
+        data=video_bytes,
+        timeout=120,
+    ).raise_for_status()
+
+    return publish_id
+
+
+# ===================================================================
+#  Twitch helpers
+# ===================================================================
+_twitch_token_cache = {"token": None, "expires": 0}
+
+
+def _get_twitch_token():
+    now = time.time()
+    if _twitch_token_cache["token"] and now < _twitch_token_cache["expires"]:
+        return _twitch_token_cache["token"]
+
+    resp = requests.post(
+        "https://id.twitch.tv/oauth2/token",
+        data={
+            "client_id": TWITCH_CLIENT_ID,
+            "client_secret": TWITCH_CLIENT_SECRET,
+            "grant_type": "client_credentials",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _twitch_token_cache["token"] = data["access_token"]
+    _twitch_token_cache["expires"] = now + data.get("expires_in", 3600) - 60
+    return data["access_token"]
+
+
+def _get_broadcaster_id(login: str) -> str:
+    token = _get_twitch_token()
+    resp = requests.get(
+        "https://api.twitch.tv/helix/users",
+        headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
+        params={"login": login},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    users = resp.json().get("data", [])
+    if not users:
+        raise ValueError(f"Twitch user '{login}' not found")
+    return users[0]["id"]
+
+
+# ===================================================================
+#  TikTok token helpers
+# ===================================================================
+def _get_tiktok_token():
+    remaining = _tiktok_token_store["expires_at"] - time.time()
+    if remaining <= 60 and _tiktok_token_store.get("refresh_token"):
+        try:
+            resp = requests.post(
+                "https://open.tiktokapis.com/v2/oauth/token/",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "client_key": TIKTOK_CLIENT_KEY,
+                    "client_secret": TIKTOK_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": _tiktok_token_store["refresh_token"],
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            td = resp.json()
+            if "access_token" in td:
+                _tiktok_token_store["access_token"] = td["access_token"]
+                _tiktok_token_store["refresh_token"] = td.get("refresh_token", _tiktok_token_store["refresh_token"])
+                _tiktok_token_store["expires_at"] = time.time() + td.get("expires_in", 86400)
+                _save_tokens()
+        except Exception:
+            pass
+    return _tiktok_token_store.get("access_token")
+
+
+# ===================================================================
+#  Topic bank
+# ===================================================================
+TOPIC_BANK = [
+    ("Rank the top 10 Twitch streamers of all time — most overrated to most underrated", "tier_list"),
+    ("xQc is actually bad for Twitch culture and here's the proof", "hot_take"),
+    ("The real reason Ninja failed on Mixer (it wasn't Microsoft's fault)", "rise_and_fall"),
+    ("Pokimane's Twitch success was built on something most people ignore", "accountability"),
+    ("Twitch had one chance to beat YouTube and threw it away in 2021", "hot_take"),
+    ("The most overrated streamer of every year from 2015 to present", "tier_list"),
+    ("HasanAbi vs Destiny — who was actually right and why the community got it wrong", "hot_take"),
+    ("The gambling ban on Twitch was a mistake — here's the data", "hot_take"),
+    ("Why the hot tub meta was Twitch's best era for viewer numbers", "hot_take"),
+    ("Amouranth's rise proves Twitch rewards one thing above all else", "accountability"),
+    ("The top 5 Twitch bans that were 100% deserved — no debate", "tier_list"),
+    ("The top 5 Twitch bans that were completely unfair and never explained", "accountability"),
+    ("Every major streamer who left Twitch — ranked by how bad it hurt the platform", "tier_list"),
+    ("The Dr Disrespect ban theory that actually makes the most sense", "hot_take"),
+    ("Twitch 2016 vs Twitch 2024 — a tier list of which era was better by category", "tier_list"),
+    ("Ranking Asmongold's most controversial opinions — does he deserve his platform?", "accountability"),
+    ("The streamer who deserves more criticism than they get (and why the community protects them)", "accountability"),
+    ("Why Just Chatting killed gaming content on Twitch", "hot_take"),
+    ("The IRL streaming category tier list — ranked by damage done to the platform", "tier_list"),
+    ("Ranking every Twitch policy from 2018 to 2024 from worst to least bad", "tier_list"),
+    ("The most toxic Twitch fanbases ranked — prepare to be offended", "tier_list"),
+    ("Why YouTube Gaming was actually better and Twitch fans won't admit it", "hot_take"),
+    ("Kick.com honest tier list — rating every big streamer who moved there", "tier_list"),
+    ("The streamers who should have been banned but never were", "accountability"),
+    ("Twitch viewer culture then vs now — what happened to the community", "nostalgia"),
+    ("The real winners and losers of the 2021 creator exodus to YouTube", "rise_and_fall"),
+    ("Ranking Twitch's worst decisions of all time (the company, not streamers)", "tier_list"),
+    ("Which Twitch streamer hurt the platform the most — a data-backed argument", "accountability"),
+    ("The most underrated Twitch moments that deserved way more coverage", "nostalgia"),
+    ("Why old Twitch fans can't stand modern streaming culture — are they right?", "nostalgia"),
+]
+
+USED_TOPICS_FILE = TEMP_DIR / "used_topics.json"
+
+
+def _pick_topic() -> tuple:
+    try:
+        used = json.loads(USED_TOPICS_FILE.read_text()) if USED_TOPICS_FILE.exists() else []
+    except Exception:
+        used = []
+
+    available = [(t, p) for t, p in TOPIC_BANK if t not in used]
+    if not available:
+        USED_TOPICS_FILE.unlink(missing_ok=True)
+        available = TOPIC_BANK
+
+    topic, pillar = random.choice(available)
+
+    used.append(topic)
+    try:
+        USED_TOPICS_FILE.write_text(json.dumps(used))
+    except Exception:
+        pass
+
+    return topic, pillar
+
+
+# ===================================================================
+#  Routes — Static / utility
+# ===================================================================
 @app.route("/")
 def home():
     return "ClipLoreTV Auto-Post Service is running."
@@ -317,33 +654,16 @@ No analytics or tracking services are used.</p>
 
 
 # ===================================================================
-#  TikTok Login Kit OAuth Flow
+#  TikTok OAuth routes
 # ===================================================================
-TIKTOK_SCOPES = "user.info.basic,video.publish,video.upload"
-
-
 @app.route("/tiktok/auth")
 def tiktok_auth():
-    """Redirect to TikTok authorization page.
-
-    Visit this URL in your browser to start the OAuth flow.
-    TikTok will redirect back to /tiktok/callback with an auth code.
-    """
-    import hashlib
-    import secrets
-
-    # CSRF state token
     state = secrets.token_urlsafe(16)
-    # PKCE code verifier + challenge
     code_verifier = secrets.token_urlsafe(64)
-    code_challenge = (
-        hashlib.sha256(code_verifier.encode())
-        .digest()
-    )
-    import base64
-    code_challenge_b64 = base64.urlsafe_b64encode(code_challenge).rstrip(b"=").decode()
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
 
-    # Store verifier in a cookie so callback can use it
     auth_url = (
         "https://www.tiktok.com/v2/auth/authorize/"
         f"?client_key={TIKTOK_CLIENT_KEY}"
@@ -351,7 +671,7 @@ def tiktok_auth():
         f"&response_type=code"
         f"&redirect_uri={TIKTOK_REDIRECT_URI}"
         f"&state={state}"
-        f"&code_challenge={code_challenge_b64}"
+        f"&code_challenge={code_challenge}"
         f"&code_challenge_method=S256"
     )
 
@@ -363,7 +683,6 @@ def tiktok_auth():
 
 @app.route("/tiktok/callback")
 def tiktok_callback():
-    """Handle TikTok OAuth callback — exchange auth code for access token."""
     code = request.args.get("code", "")
     state = request.args.get("state", "")
     error = request.args.get("error", "")
@@ -371,14 +690,12 @@ def tiktok_callback():
     if error:
         return jsonify({"error": error, "description": request.args.get("error_description", "")}), 400
 
-    # Validate CSRF state
     saved_state = request.cookies.get("tiktok_state", "")
     if not state or state != saved_state:
         return jsonify({"error": "State mismatch — possible CSRF. Try /tiktok/auth again."}), 403
 
     code_verifier = request.cookies.get("tiktok_verifier", "")
 
-    # Exchange code for token
     try:
         token_resp = requests.post(
             "https://open.tiktokapis.com/v2/oauth/token/",
@@ -399,19 +716,19 @@ def tiktok_callback():
         if "access_token" not in token_data:
             return jsonify({"error": "No access_token in response", "raw": token_data}), 502
 
-        # Store tokens
         _tiktok_token_store["access_token"] = token_data["access_token"]
         _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", "")
         _tiktok_token_store["expires_at"] = time.time() + token_data.get("expires_in", 86400)
         _tiktok_token_store["open_id"] = token_data.get("open_id", "")
         _save_tokens()
 
-        return """<!DOCTYPE html>
+        hours = token_data.get("expires_in", 0) // 3600
+        return f"""<!DOCTYPE html>
 <html><head><title>ClipLoreTV — TikTok Connected</title></head>
 <body style="font-family:system-ui;max-width:600px;margin:80px auto;text-align:center">
 <h1>TikTok Connected!</h1>
 <p>Access token stored. You can now use <code>/pipeline</code> without manually passing a token.</p>
-<p>Token expires in """ + str(token_data.get("expires_in", 0) // 3600) + """ hours.</p>
+<p>Token expires in {hours} hours.</p>
 <p><a href="/tiktok/status">Check token status</a></p>
 </body></html>"""
 
@@ -422,7 +739,6 @@ def tiktok_callback():
 @app.route("/tiktok/refresh", methods=["POST"])
 @require_api_key
 def tiktok_refresh():
-    """Refresh the TikTok access token using the stored refresh token."""
     refresh_token = _tiktok_token_store.get("refresh_token", "")
     if not refresh_token:
         return jsonify({"error": "No refresh token stored. Visit /tiktok/auth first."}), 400
@@ -457,7 +773,6 @@ def tiktok_refresh():
 
 @app.route("/tiktok/status")
 def tiktok_status():
-    """Check whether a TikTok token is stored and still valid."""
     token = _tiktok_token_store.get("access_token")
     if not token:
         return jsonify({"authenticated": False, "message": "No token. Visit /tiktok/auth to connect."})
@@ -471,194 +786,35 @@ def tiktok_status():
     })
 
 
-def _get_tiktok_token():
-    """Get the stored TikTok user access token, auto-refreshing if needed."""
-    remaining = _tiktok_token_store["expires_at"] - time.time()
-
-    # If expired but we have a refresh token, try refreshing
-    if remaining <= 60 and _tiktok_token_store.get("refresh_token"):
-        try:
-            resp = requests.post(
-                "https://open.tiktokapis.com/v2/oauth/token/",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    "client_key": TIKTOK_CLIENT_KEY,
-                    "client_secret": TIKTOK_CLIENT_SECRET,
-                    "grant_type": "refresh_token",
-                    "refresh_token": _tiktok_token_store["refresh_token"],
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            td = resp.json()
-            if "access_token" in td:
-                _tiktok_token_store["access_token"] = td["access_token"]
-                _tiktok_token_store["refresh_token"] = td.get("refresh_token", _tiktok_token_store["refresh_token"])
-                _tiktok_token_store["expires_at"] = time.time() + td.get("expires_in", 86400)
-                _save_tokens()
-        except Exception:
-            pass  # fall through — caller will get the stale token or None
-
-    return _tiktok_token_store.get("access_token")
-
-
 # ===================================================================
-#  ENDPOINT 1 — /generate-script
+#  API endpoints
 # ===================================================================
-CLIPLORE_SYSTEM_PROMPT = """You are a short-form video scriptwriter for ClipLoreTV, a TikTok channel that posts AI-narrated gaming highlight commentary over Twitch clip footage. Your scripts are engineered for maximum watch-through rate, comments, and shares on TikTok.
-
-SCRIPT STRUCTURE (strict — follow every time):
-
-[HOOKW`— First 3 seconds. The single most controversial, shocking, or curiosity-gap statement in the entire script. This line determines whether 90% of viewers stay or leave. Must create an immediate urge to keep watching OR to comment in disagreement.
-
-[VISUAL: describe what clip footage should show during this section]
-
-[BUILD] — Next 15–20 seconds. 3–4 rapid-fire beats that escalate the tension or argument. Each beat is 1–2 sentences max. Use pattern interrupts between beats:
-  - Pattern interrupt options: rhetorical question, "but here's the thing," dramatic pause cue "[PAUSE 0.5s]", tone shift, or direct audience challenge
-
-[VISUAL: describe clip footage for each beat]
-
-[PAYOFF] — Next 10–15 seconds. Deliver the main point, reveal, or ranking. This is where you cash the check the hook wrote. Be specific — names, events, data.
-
-[VISUAL: describe the key clip moment that matches the payoff]
-
-[CTA] — Final 5 seconds. Comment bait that splits the audience. Never generic. Always force a choice:
-  - "S tier or D tier? Comment now."
-  - "Who was actually right? Drop a name."
-  - "Am I wrong? Prove it below."
-
-VOICE RULES:
-- Total length: 120–180 words (40–60 second TikTok)
-- Tone: confident, slightly cocky, like a friend who watches too much Twitch
-- No "Hey guys," no "Welcome back," no intro fluff — open cold
-- Short sentences. Punchy. Never more than 15 words per sentence.
-- State opinions as facts. "The truth is..." not "I think..."
-- Use present tense for drama: "He walks on stage and the chat goes insane"
-- Reference specific moments, usernames, or events — never be vague
-
-OUTPUT FORMAT:
-Return ONLY the script text. Include [VISUAL] tags inline. Include [PAUSE] tags where dramatic pauses should go. No headers, no notes, no meta-commentary."""
-
-
 @app.route("/generate-script", methods=["POST"])
 @require_api_key
-def generate_script():
-    """Generate a TikTok commentary script using Claude API.
-
-    JSON body:
-      topic (str, required): The topic/prompt for the script.
-      pillar (str, optional): One of tier_list | hot_take | nostalgia | accountability | rise_and_fall
-    Returns:
-      { script: str, word_count: int }
-    """
+def generate_script_endpoint():
     data = request.get_json(force=True)
     topic = data.get("topic", "")
     if not topic or not isinstance(topic, str):
         return jsonify({"error": "topic is required (string)"}), 400
     if len(topic) > 1000:
         return jsonify({"error": "topic too long (max 1000 chars)"}), 400
-
     if not ANTHROPIC_API_KEY:
         return jsonify({"error": "Server misconfigured"}), 500
 
-    # Build the user message with optional pillar framing
     pillar = data.get("pillar", "")
-    valid_pillars = {"tier_list", "hot_take", "nostalgia", "accountability", "rise_and_fall", ""}
-    if pillar not in valid_pillars:
-        return jsonify({"error": f"Invalid pillar. Must be one of: {', '.join(valid_pillars - {''})}"}), 400
-
-    pillar_prefix = {
-        "tier_list": "Write a tier list script ranking ",
-        "hot_take": "Write a hot take script about ",
-        "nostalgia": "Write a nostalgia script comparing ",
-        "accountability": "Write an accountability script about ",
-        "rise_and_fall": "Write a rise-and-fall script about ",
-    }
-    user_msg = pillar_prefix.get(pillar, "") + topic
+    if pillar not in VALID_PILLARS:
+        return jsonify({"error": f"Invalid pillar. Must be one of: {', '.join(VALID_PILLARS - {''})}"}), 400
 
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1024,
-                "system": CLIPLORE_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        script_text = result["content"][0]["text"]
-        word_count = len(script_text.split())
-        return jsonify({"script": script_text, "word_count": word_count})
+        script_text = generate_script_text(topic, pillar)
+        return jsonify({"script": script_text, "word_count": len(script_text.split())})
     except requests.RequestException as e:
         return jsonify({"error": f"Script generation failed: {_sanitize(str(e))}"}), 502
 
 
-# ===================================================================
-#  ENDPOINT 2 — /fetch-clips
-# ===================================================================
-_twitch_token_cache = {"token": None, "expires": 0}
-
-
-def _get_twitch_token():
-    """Get or refresh Twitch app access token."""
-    now = time.time()
-    if _twitch_token_cache["token"] and now < _twitch_token_cache["expires"]:
-        return _twitch_token_cache["token"]
-
-    resp = requests.post(
-        "https://id.twitch.tv/oauth2/token",
-        data={
-            "client_id": TWITCH_CLIENT_ID,
-            "client_secret": TWITCH_CLIENT_SECRET,
-            "grant_type": "client_credentials",
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    _twitch_token_cache["token"] = data["access_token"]
-    _twitch_token_cache["expires"] = now + data.get("expires_in", 3600) - 60
-    return data["access_token"]
-
-
-def _get_broadcaster_id(login: str) -> str:
-    """Resolve a Twitch login name to broadcaster ID."""
-    token = _get_twitch_token()
-    resp = requests.get(
-        "https://api.twitch.tv/helix/users",
-        headers={
-            "Client-ID": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {token}",
-        },
-        params={"login": login},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    users = resp.json().get("data", [])
-    if not users:
-        raise ValueError(f"Twitch user '{login}' not found")
-    return users[0]["id"]
-
-
 @app.route("/fetch-clips", methods=["POST"])
 @require_api_key
-def fetch_clips():
-    """Fetch top Twitch clips for given streamers.
-
-    JSON body:
-      streamers (list[str], required): Twitch login names e.g. ["xqc", "pokimane"]
-      count (int, optional): Clips per streamer (default 5, max 20)
-    Returns:
-      { clips: [ { streamer, title, url, thumbnail_url, view_count, duration } ] }
-    """
+def fetch_clips_endpoint():
     data = request.get_json(force=True)
     streamers = data.get("streamers", [])
     count = min(data.get("count", 5), 20)
@@ -667,7 +823,6 @@ def fetch_clips():
         return jsonify({"error": "streamers list is required"}), 400
     if len(streamers) > 10:
         return jsonify({"error": "Max 10 streamers per request"}), 400
-    # Validate streamer names (alphanumeric + underscore, Twitch format)
     for s in streamers:
         if not isinstance(s, str) or not re.match(r"^[a-zA-Z0-9_]{1,25}$", s):
             return jsonify({"error": f"Invalid streamer name: {s[:30]}"}), 400
@@ -682,29 +837,23 @@ def fetch_clips():
                 bid = _get_broadcaster_id(streamer)
                 resp = requests.get(
                     "https://api.twitch.tv/helix/clips",
-                    headers={
-                        "Client-ID": TWITCH_CLIENT_ID,
-                        "Authorization": f"Bearer {token}",
-                    },
+                    headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
                     params={"broadcaster_id": bid, "first": count},
                     timeout=10,
                 )
                 resp.raise_for_status()
                 for clip in resp.json().get("data", []):
-                    # Build download URL from thumbnail
                     thumb = clip.get("thumbnail_url", "")
                     download_url = thumb.split("-preview-")[0] + ".mp4" if "-preview-" in thumb else ""
-                    all_clips.append(
-                        {
-                            "streamer": streamer,
-                            "title": clip.get("title", ""),
-                            "url": clip.get("url", ""),
-                            "download_url": download_url,
-                            "thumbnail_url": thumb,
-                            "view_count": clip.get("view_count", 0),
-                            "duration": clip.get("duration", 0),
-                        }
-                    )
+                    all_clips.append({
+                        "streamer": streamer,
+                        "title": clip.get("title", ""),
+                        "url": clip.get("url", ""),
+                        "download_url": download_url,
+                        "thumbnail_url": thumb,
+                        "view_count": clip.get("view_count", 0),
+                        "duration": clip.get("duration", 0),
+                    })
             except Exception as e:
                 all_clips.append({"streamer": streamer, "error": _sanitize(str(e))})
 
@@ -713,25 +862,9 @@ def fetch_clips():
         return jsonify({"error": _sanitize(str(e))}), 502
 
 
-# ===================================================================
-#  ENDPOINT 3 — /assemble-video
-# ===================================================================
 @app.route("/assemble-video", methods=["POST"])
 @require_api_key
-def assemble_video():
-    """Assemble a TikTok-ready video from script + clips.
-
-    JSON body:
-      script (str, required): The voiceover script text (strip [VISUAL]/[PAUSE] tags before sending, or they'll be auto-stripped).
-      clip_urls (list[str], required): Direct MP4 URLs of Twitch clips to use as footage.
-    Returns:
-      { video_path: str, duration: float }
-
-    The assembled video is 1080x1920 (9:16), 30fps, with:
-      - Concatenated clip footage scaled/cropped to vertical
-      - gTTS voiceover layered on top
-      - Clip footage trimmed to match voiceover length
-    """
+def assemble_video_endpoint():
     data = request.get_json(force=True)
     script = data.get("script", "")
     clip_urls = data.get("clip_urls", [])
@@ -744,146 +877,24 @@ def assemble_video():
         return jsonify({"error": "clip_urls list is required"}), 400
     if len(clip_urls) > 10:
         return jsonify({"error": "Max 10 clip URLs per request"}), 400
-    # Validate clip URLs — must be HTTPS
     for url in clip_urls:
         if not isinstance(url, str) or not url.startswith("https://"):
             return jsonify({"error": "All clip_urls must be HTTPS URLs"}), 400
 
-    # Cleanup old temp files before creating new ones
-    _cleanup_temp()
-
-    job_id = uuid.uuid4().hex[:10]
-    job_dir = TEMP_DIR / job_id
-    job_dir.mkdir(exist_ok=True)
-
     try:
-        # --- 1. Clean script (strip [VISUAL:...], [PAUSE ...], [HOOK], [BUILD], [PAYOFF], [CTA] tags) ---
-        import re
-
-        clean_script = re.sub(r"\[VISUAL:[^\]]*\]", "", script)
-        clean_script = re.sub(r"\[PAUSE[^\]]*\]", "", clean_script)
-        clean_script = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", clean_script)
-        clean_script = re.sub(r"\n{3,}", "\n\n", clean_script).strip()
-
-        # --- 2. Generate TTS audio ---
-        tts_path = job_dir / "voiceover.mp3"
-        tts = gTTS(text=clean_script, lang="en", tld="co.uk")  # British accent sounds good for commentary
-        tts.save(str(tts_path))
-
-        # Get voiceover duration
-        probe = subprocess.run(
-            [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_format", str(tts_path),
-            ],
-            capture_output=True, text=True, timeout=15,
-        )
-        vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
-
-        # --- 3. Download clips ---
-        clip_paths = []
-        for i, url in enumerate(clip_urls[:5]):  # cap at 5 clips
-            clip_path = job_dir / f"clip_{i}.mp4"
-            try:
-                r = requests.get(url, timeout=30, stream=True)
-                r.raise_for_status()
-                with open(clip_path, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                clip_paths.append(clip_path)
-            except Exception:
-                continue
-
-        if not clip_paths:
-            return jsonify({"error": "Could not download any clips"}), 400
-
-        # --- 4. Scale each clip to 1080x1920 (9:16) and loop/trim to fill voiceover ---
-        scaled_clips = []
-        for i, cp in enumerate(clip_paths):
-            scaled = job_dir / f"scaled_{i}.mp4"
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(cp),
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                    "-an",  # strip audio — we'll use TTS
-                    "-t", str(vo_duration / len(clip_paths) + 1),  # each clip gets equal share + 1s buffer
-                    str(scaled),
-                ],
-                capture_output=True, timeout=120,
-            )
-            if scaled.exists():
-                scaled_clips.append(scaled)
-
-        if not scaled_clips:
-            return jsonify({"error": "FFmpeg scaling failed"}), 500
-
-        # --- 5. Concatenate scaled clips ---
-        concat_list = job_dir / "concat.txt"
-        with open(concat_list, "w") as f:
-            for sc in scaled_clips:
-                f.write(f"file '{sc}'\n")
-
-        concat_video = job_dir / "concat.mp4"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(concat_list),
-                "-c", "copy", "-t", str(vo_duration),
-                str(concat_video),
-            ],
-            capture_output=True, timeout=120,
-        )
-
-        # --- 6. Merge video + voiceover ---
-        final_video = job_dir / "final.mp4"
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", str(concat_video),
-                "-i", str(tts_path),
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(final_video),
-            ],
-            capture_output=True, timeout=120,
-        )
-
-        if not final_video.exists():
-            return jsonify({"error": "Final video assembly failed"}), 500
-
+        video_path, duration = assemble_video_from_parts(script, clip_urls)
         return jsonify({
-            "video_path": str(final_video),
-            "job_id": job_id,
-            "duration": vo_duration,
+            "video_path": str(video_path),
+            "job_id": video_path.parent.name,
+            "duration": duration,
         })
-
     except Exception as e:
         return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}"}), 500
 
 
-# ===================================================================
-#  ENDPOINT 4 — /post-to-tiktok
-# ===================================================================
 @app.route("/post-to-tiktok", methods=["POST"])
 @require_api_key
-def post_to_tiktok():
-    """Upload a video to TikTok via Content Posting API.
-
-    JSON body:
-      video_path (str, required): Path to the assembled video file on disk.
-      access_token (str, required): TikTok user access token (from OAuth flow).
-      description (str, optional): Caption/description with hashtags.
-    Returns:
-      { publish_id: str, status: str }
-
-    NOTE: TikTok Content Posting API uses a two-step upload:
-      1. Initialize upload → get upload_url
-      2. PUT video bytes to upload_url
-      3. Publish with description
-    """
+def post_to_tiktok_endpoint():
     data = request.get_json(force=True)
     video_path = data.get("video_path", "")
     access_token = data.get("access_token", "") or _get_tiktok_token()
@@ -894,91 +905,27 @@ def post_to_tiktok():
     if not access_token:
         return jsonify({"error": "No access_token provided and no stored token. Visit /tiktok/auth first."}), 401
 
-    # Path traversal protection — only allow files inside TEMP_DIR
     video_file = _safe_path(video_path)
     if not video_file.exists():
         return jsonify({"error": "Video file not found"}), 404
 
-    file_size = video_file.stat().st_size
-    if file_size > 50 * 1024 * 1024:
-        return jsonify({"error": "Video too large (max 50 MB)"}), 400
-
     try:
-        # --- Step 1: Initialize upload ---
-        init_resp = requests.post(
-            "https://open.tiktokapis.com/v2/post/publish/video/init/",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json; charset=UTF-8",
-            },
-            json={
-                "post_info": {
-                    "title": description[:150] if description else "ClipLoreTV",
-                    "privacy_level": "PUBLIC_TO_EVERYONE",
-                    "disable_duet": False,
-                    "disable_comment": False,
-                    "disable_stitch": False,
-                },
-                "source_info": {
-                    "source": "FILE_UPLOAD",
-                    "video_size": file_size,
-                    "chunk_size": file_size,  # single-chunk upload
-                    "total_chunk_count": 1,
-                },
-            },
-            timeout=30,
-        )
-        init_resp.raise_for_status()
-        init_data = init_resp.json()
-
-        if init_data.get("error", {}).get("code") != "ok":
-            return jsonify({"error": f"TikTok init failed: {init_data}"}), 502
-
-        upload_url = init_data["data"]["upload_url"]
-        publish_id = init_data["data"]["publish_id"]
-
-        # --- Step 2: Upload video bytes ---
-        with open(video_file, "rb") as vf:
-            video_bytes = vf.read()
-
-        upload_resp = requests.put(
-            upload_url,
-            headers={
-                "Content-Type": "video/mp4",
-                "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
-            },
-            data=video_bytes,
-            timeout=120,
-        )
-        upload_resp.raise_for_status()
-
+        publish_id = upload_to_tiktok(video_file, access_token, description)
         return jsonify({
             "publish_id": publish_id,
             "status": "uploaded",
             "message": "Video uploaded to TikTok. Check Creator Center for processing status.",
         })
-
-    except requests.RequestException as e:
+    except Exception as e:
         return jsonify({"error": f"TikTok API error: {_sanitize(str(e))}"}), 502
 
 
 # ===================================================================
-#  BONUS — /pipeline (full end-to-end: topic → posted video)
+#  Full pipeline & cron — both use _run_pipeline
 # ===================================================================
 @app.route("/pipeline", methods=["POST"])
 @require_api_key
 def pipeline():
-    """Run the full pipeline: topic → script → clips → video → TikTok post.
-
-    JSON body:
-      topic (str, required): Topic for the script.
-      pillar (str, optional): Content pillar.
-      streamers (list[str], required): Twitch streamers to pull clips from.
-      tiktok_access_token (str, required): TikTok OAuth token.
-      description (str, optional): TikTok caption with hashtags.
-    Returns:
-      Full pipeline result with script, clips, video path, and TikTok publish ID.
-    """
     data = request.get_json(force=True)
     topic = data.get("topic", "")
     pillar = data.get("pillar", "")
@@ -989,371 +936,42 @@ def pipeline():
     if not topic or not streamers:
         return jsonify({"error": "topic and streamers are required"}), 400
     if not tiktok_token:
-        return jsonify({"error": "No tiktok_access_token provided and no stored token. Visit /tiktok/auth first."}), 401
+        return jsonify({"error": "No tiktok_access_token and no stored token. Visit /tiktok/auth first."}), 401
 
-    results = {"steps": {}}
-
-    # Step 1: Generate script
-    try:
-        pillar_prefix = {
-            "tier_list": "Write a tier list script ranking ",
-            "hot_take": "Write a hot take script about ",
-            "nostalgia": "Write a nostalgia script comparing ",
-            "accountability": "Write an accountability script about ",
-            "rise_and_fall": "Write a rise-and-fall script about ",
-        }
-        user_msg = pillar_prefix.get(pillar, "") + topic
-
-        script_resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1024,
-                "system": CLIPLORE_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-            timeout=30,
-        )
-        script_resp.raise_for_status()
-        script_text = script_resp.json()["content"][0]["text"]
-        results["steps"]["script"] = {"status": "ok", "script": script_text}
-    except Exception as e:
-        return jsonify({"error": f"Script generation failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
-
-    # Step 2: Fetch clips
-    try:
-        token = _get_twitch_token()
-        clip_urls = []
-        for streamer in streamers:
-            bid = _get_broadcaster_id(streamer)
-            resp = requests.get(
-                "https://api.twitch.tv/helix/clips",
-                headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
-                params={"broadcaster_id": bid, "first": 3},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            for clip in resp.json().get("data", []):
-                thumb = clip.get("thumbnail_url", "")
-                if "-preview-" in thumb:
-                    clip_urls.append(thumb.split("-preview-")[0] + ".mp4")
-        results["steps"]["clips"] = {"status": "ok", "count": len(clip_urls)}
-    except Exception as e:
-        return jsonify({"error": f"Clip fetch failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
-
-    if not clip_urls:
-        return jsonify({"error": "No clips found", "steps": results["steps"]}), 400
-
-    # Step 3: Assemble video
-    try:
-        import re
-        clean = re.sub(r"\[VISUAL:[^\]]*\]", "", script_text)
-        clean = re.sub(r"\[PAUSE[^\]]*\]", "", clean)
-        clean = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", clean)
-        clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
-
-        job_id = uuid.uuid4().hex[:10]
-        job_dir = TEMP_DIR / job_id
-        job_dir.mkdir(exist_ok=True)
-
-        # TTS
-        tts_path = job_dir / "voiceover.mp3"
-        tts = gTTS(text=clean, lang="en", tld="co.uk")
-        tts.save(str(tts_path))
-
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(tts_path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
-
-        # Download clips
-        clip_paths = []
-        for i, url in enumerate(clip_urls[:5]):
-            cp = job_dir / f"clip_{i}.mp4"
-            try:
-                r = requests.get(url, timeout=30, stream=True)
-                r.raise_for_status()
-                with open(cp, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                clip_paths.append(cp)
-            except Exception:
-                continue
-
-        # Scale clips
-        scaled = []
-        for i, cp in enumerate(clip_paths):
-            sp = job_dir / f"scaled_{i}.mp4"
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(cp),
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an",
-                    "-t", str(vo_duration / max(len(clip_paths), 1) + 1),
-                    str(sp),
-                ],
-                capture_output=True, timeout=120,
-            )
-            if sp.exists():
-                scaled.append(sp)
-
-        # Concat
-        concat_list = job_dir / "concat.txt"
-        with open(concat_list, "w") as f:
-            for s in scaled:
-                f.write(f"file '{s}'\n")
-
-        concat_vid = job_dir / "concat.mp4"
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-             "-c", "copy", "-t", str(vo_duration), str(concat_vid)],
-            capture_output=True, timeout=120,
-        )
-
-        # Merge
-        final = job_dir / "final.mp4"
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-             str(final)],
-            capture_output=True, timeout=120,
-        )
-
-        if not final.exists():
-            return jsonify({"error": "Video assembly failed", "steps": results["steps"]}), 500
-
-        results["steps"]["video"] = {"status": "ok", "path": str(final), "duration": vo_duration}
-    except Exception as e:
-        return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
-
-    # Step 4: Post to TikTok
-    try:
-        file_size = final.stat().st_size
-        init_resp = requests.post(
-            "https://open.tiktokapis.com/v2/post/publish/video/init/",
-            headers={
-                "Authorization": f"Bearer {tiktok_token}",
-                "Content-Type": "application/json; charset=UTF-8",
-            },
-            json={
-                "post_info": {
-                    "title": description[:150] if description else "ClipLoreTV",
-                    "privacy_level": "PUBLIC_TO_EVERYONE",
-                    "disable_duet": False,
-                    "disable_comment": False,
-                    "disable_stitch": False,
-                },
-                "source_info": {
-                    "source": "FILE_UPLOAD",
-                    "video_size": file_size,
-                    "chunk_size": file_size,
-                    "total_chunk_count": 1,
-                },
-            },
-            timeout=30,
-        )
-        init_resp.raise_for_status()
-        init_data = init_resp.json()
-
-        upload_url = init_data["data"]["upload_url"]
-        publish_id = init_data["data"]["publish_id"]
-
-        with open(final, "rb") as vf:
-            video_bytes = vf.read()
-
-        requests.put(
-            upload_url,
-            headers={
-                "Content-Type": "video/mp4",
-                "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
-            },
-            data=video_bytes,
-            timeout=120,
-        ).raise_for_status()
-
-        results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id}
-    except Exception as e:
-        results["steps"]["tiktok"] = {"status": "error", "error": _sanitize(str(e))}
-
-    return jsonify(results)
+    return _run_pipeline(topic, pillar, streamers, tiktok_token, description)
 
 
-# ===================================================================
-#  TOPIC BANK — built-in topics for automated runs
-# ===================================================================
-import random
-
-TOPIC_BANK = [
-    ("Rank the top 10 Twitch streamers of all time — most overrated to most underrated", "tier_list"),
-    ("xQc is actually bad for Twitch culture and here's the proof", "hot_take"),
-    ("The real reason Ninja failed on Mixer (it wasn't Microsoft's fault)", "rise_and_fall"),
-    ("Pokimane's Twitch success was built on something most people ignore", "accountability"),
-    ("Twitch had one chance to beat YouTube and threw it away in 2021", "hot_take"),
-    ("The most overrated streamer of every year from 2015 to present", "tier_list"),
-    ("HasanAbi vs Destiny — who was actually right and why the community got it wrong", "hot_take"),
-    ("The gambling ban on Twitch was a mistake — here's the data", "hot_take"),
-    ("Why the hot tub meta was Twitch's best era for viewer numbers", "hot_take"),
-    ("Amouranth's rise proves Twitch rewards one thing above all else", "accountability"),
-    ("The top 5 Twitch bans that were 100% deserved — no debate", "tier_list"),
-    ("The top 5 Twitch bans that were completely unfair and never explained", "accountability"),
-    ("Every major streamer who left Twitch — ranked by how bad it hurt the platform", "tier_list"),
-    ("The Dr Disrespect ban theory that actually makes the most sense", "hot_take"),
-    ("Twitch 2016 vs Twitch 2024 — a tier list of which era was better by category", "tier_list"),
-    ("Ranking Asmongold's most controversial opinions — does he deserve his platform?", "accountability"),
-    ("The streamer who deserves more criticism than they get (and why the community protects them)", "accountability"),
-    ("Why Just Chatting killed gaming content on Twitch", "hot_take"),
-    ("The IRL streaming category tier list — ranked by damage done to the platform", "tier_list"),
-    ("Ranking every Twitch policy from 2018 to 2024 from worst to least bad", "tier_list"),
-    ("The most toxic Twitch fanbases ranked — prepare to be offended", "tier_list"),
-    ("Why YouTube Gaming was actually better and Twitch fans won't admit it", "hot_take"),
-    ("Kick.com honest tier list — rating every big streamer who moved there", "tier_list"),
-    ("The streamers who should have been banned but never were", "accountability"),
-    ("Twitch viewer culture then vs now — what happened to the community", "nostalgia"),
-    ("The real winners and losers of the 2021 creator exodus to YouTube", "rise_and_fall"),
-    ("Ranking Twitch's worst decisions of all time (the company, not streamers)", "tier_list"),
-    ("Which Twitch streamer hurt the platform the most — a data-backed argument", "accountability"),
-    ("The most underrated Twitch moments that deserved way more coverage", "nostalgia"),
-    ("Why old Twitch fans can't stand modern streaming culture — are they right?", "nostalgia"),
-]
-
-# Track used topics so we don't repeat (persisted to disk)
-USED_TOPICS_FILE = TEMP_DIR / "used_topics.json"
-
-
-def _load_used_topics() -> list:
-    try:
-        if USED_TOPICS_FILE.exists():
-            with open(USED_TOPICS_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return []
-
-
-def _save_used_topic(topic: str):
-    used = _load_used_topics()
-    used.append(topic)
-    try:
-        with open(USED_TOPICS_FILE, "w") as f:
-            json.dump(used, f)
-    except Exception:
-        pass
-
-
-def _pick_topic() -> tuple:
-    """Pick an unused topic. Resets the pool when all are used."""
-    used = _load_used_topics()
-    available = [(t, p) for t, p in TOPIC_BANK if t not in used]
-    if not available:
-        # Reset — all topics used, start over
-        try:
-            USED_TOPICS_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
-        available = TOPIC_BANK
-    topic, pillar = random.choice(available)
-    _save_used_topic(topic)
-    return topic, pillar
-
-
-# Default streamers to pull clips from
-DEFAULT_STREAMERS = ["xqc", "pokimane", "asmongold", "hasanabi", "shroud", "nickmercs", "timthetatman"]
-
-
-# ===================================================================
-#  /cron — automated trigger (call from external cron service)
-# ===================================================================
 @app.route("/cron", methods=["POST"])
 @require_api_key
 def cron():
-    """Automated pipeline trigger — picks a topic, builds a video, posts to TikTok.
-
-    Call this from cron-job.org or similar service every 12 hours.
-    Requires X-Api-Key header.
-
-    Optional JSON body:
-      streamers (list[str]): Override default streamers.
-      description (str): Override TikTok caption.
-    """
-    # Check TikTok auth
     tiktok_token = _get_tiktok_token()
     if not tiktok_token:
         return jsonify({"error": "TikTok not authenticated. Visit /tiktok/auth first."}), 401
 
     data = request.get_json(silent=True) or {}
     streamers = data.get("streamers", random.sample(DEFAULT_STREAMERS, min(3, len(DEFAULT_STREAMERS))))
+    description = data.get("description", "#twitch #gaming #streamer #cliploretv #shorts")
 
-    # Pick topic
     topic, pillar = _pick_topic()
-    log.info("CRON: picked topic=%s pillar=%s streamers=%s", topic[:50], pillar, streamers)
+    log.info("CRON: topic=%s pillar=%s streamers=%s", topic[:50], pillar, streamers)
 
-    # Build description with hashtags
-    description = data.get("description", "")
-    if not description:
-        description = f"#twitch #gaming #streamer #cliploretv #shorts"
+    return _run_pipeline(topic, pillar, streamers, tiktok_token, description)
 
-    # Run the pipeline by calling our own /pipeline logic internally
+
+def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
+    """Shared pipeline logic for /pipeline and /cron."""
     results = {"topic": topic, "pillar": pillar, "streamers": streamers, "steps": {}}
 
     # Step 1: Generate script
     try:
-        pillar_prefix = {
-            "tier_list": "Write a tier list script ranking ",
-            "hot_take": "Write a hot take script about ",
-            "nostalgia": "Write a nostalgia script comparing ",
-            "accountability": "Write an accountability script about ",
-            "rise_and_fall": "Write a rise-and-fall script about ",
-        }
-        user_msg = pillar_prefix.get(pillar, "") + topic
-
-        script_resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1024,
-                "system": CLIPLORE_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
-            timeout=30,
-        )
-        script_resp.raise_for_status()
-        script_text = script_resp.json()["content"][0]["text"]
+        script_text = generate_script_text(topic, pillar)
         results["steps"]["script"] = {"status": "ok", "word_count": len(script_text.split())}
     except Exception as e:
         return jsonify({"error": f"Script generation failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
 
     # Step 2: Fetch clips
     try:
-        token = _get_twitch_token()
-        clip_urls = []
-        for streamer in streamers:
-            try:
-                bid = _get_broadcaster_id(streamer)
-                resp = requests.get(
-                    "https://api.twitch.tv/helix/clips",
-                    headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
-                    params={"broadcaster_id": bid, "first": 3},
-                    timeout=10,
-                )
-                resp.raise_for_status()
-                for clip in resp.json().get("data", []):
-                    thumb = clip.get("thumbnail_url", "")
-                    if "-preview-" in thumb:
-                        clip_urls.append(thumb.split("-preview-")[0] + ".mp4")
-            except Exception:
-                continue
+        clip_urls = fetch_clip_urls(streamers)
         results["steps"]["clips"] = {"status": "ok", "count": len(clip_urls)}
     except Exception as e:
         return jsonify({"error": f"Clip fetch failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
@@ -1363,141 +981,25 @@ def cron():
 
     # Step 3: Assemble video
     try:
-        clean = re.sub(r"\[VISUAL:[^\]]*\]", "", script_text)
-        clean = re.sub(r"\[PAUSE[^\]]*\]", "", clean)
-        clean = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", clean)
-        clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
-
-        job_id = uuid.uuid4().hex[:10]
-        job_dir = TEMP_DIR / job_id
-        job_dir.mkdir(exist_ok=True)
-
-        tts_path = job_dir / "voiceover.mp3"
-        tts = gTTS(text=clean, lang="en", tld="co.uk")
-        tts.save(str(tts_path))
-
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(tts_path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
-
-        clip_paths = []
-        for i, url in enumerate(clip_urls[:5]):
-            cp = job_dir / f"clip_{i}.mp4"
-            try:
-                r = requests.get(url, timeout=30, stream=True)
-                r.raise_for_status()
-                with open(cp, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                clip_paths.append(cp)
-            except Exception:
-                continue
-
-        if not clip_paths:
-            return jsonify({"error": "Could not download any clips", "steps": results["steps"]}), 400
-
-        scaled = []
-        for i, cp in enumerate(clip_paths):
-            sp = job_dir / f"scaled_{i}.mp4"
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", str(cp),
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an",
-                    "-t", str(vo_duration / max(len(clip_paths), 1) + 1),
-                    str(sp),
-                ],
-                capture_output=True, timeout=120,
-            )
-            if sp.exists():
-                scaled.append(sp)
-
-        concat_list = job_dir / "concat.txt"
-        with open(concat_list, "w") as f:
-            for s in scaled:
-                f.write(f"file '{s}'\n")
-
-        concat_vid = job_dir / "concat.mp4"
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-             "-c", "copy", "-t", str(vo_duration), str(concat_vid)],
-            capture_output=True, timeout=120,
-        )
-
-        final = job_dir / "final.mp4"
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-             str(final)],
-            capture_output=True, timeout=120,
-        )
-
-        if not final.exists():
-            return jsonify({"error": "Video assembly failed", "steps": results["steps"]}), 500
-
-        results["steps"]["video"] = {"status": "ok", "duration": vo_duration}
+        video_path, duration = assemble_video_from_parts(script_text, clip_urls)
+        results["steps"]["video"] = {"status": "ok", "duration": duration}
     except Exception as e:
         return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
 
     # Step 4: Post to TikTok
     try:
-        file_size = final.stat().st_size
-        init_resp = requests.post(
-            "https://open.tiktokapis.com/v2/post/publish/video/init/",
-            headers={
-                "Authorization": f"Bearer {tiktok_token}",
-                "Content-Type": "application/json; charset=UTF-8",
-            },
-            json={
-                "post_info": {
-                    "title": description[:150],
-                    "privacy_level": "PUBLIC_TO_EVERYONE",
-                    "disable_duet": False,
-                    "disable_comment": False,
-                    "disable_stitch": False,
-                },
-                "source_info": {
-                    "source": "FILE_UPLOAD",
-                    "video_size": file_size,
-                    "chunk_size": file_size,
-                    "total_chunk_count": 1,
-                },
-            },
-            timeout=30,
-        )
-        init_resp.raise_for_status()
-        init_data = init_resp.json()
-
-        upload_url = init_data["data"]["upload_url"]
-        publish_id = init_data["data"]["publish_id"]
-
-        with open(final, "rb") as vf:
-            video_bytes = vf.read()
-
-        requests.put(
-            upload_url,
-            headers={
-                "Content-Type": "video/mp4",
-                "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
-            },
-            data=video_bytes,
-            timeout=120,
-        ).raise_for_status()
-
+        publish_id = upload_to_tiktok(video_path, tiktok_token, description)
         results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id}
     except Exception as e:
         results["steps"]["tiktok"] = {"status": "error", "error": _sanitize(str(e))}
 
     # Cleanup
     try:
-        shutil.rmtree(job_dir, ignore_errors=True)
+        shutil.rmtree(video_path.parent, ignore_errors=True)
     except Exception:
         pass
 
-    log.info("CRON: completed — topic=%s tiktok=%s", topic[:50], results["steps"].get("tiktok", {}).get("status"))
+    log.info("Pipeline done: topic=%s tiktok=%s", topic[:50], results["steps"].get("tiktok", {}).get("status"))
     return jsonify(results)
 
 
