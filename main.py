@@ -892,8 +892,8 @@ def tiktok_auth():
     )
 
     resp = redirect(auth_url)
-    resp.set_cookie("tiktok_state", state, httponly=True, secure=True, samesite="Strict", max_age=600)
-    resp.set_cookie("tiktok_verifier", code_verifier, httponly=True, secure=True, samesite="Strict", max_age=600)
+    resp.set_cookie("tiktok_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
+    resp.set_cookie("tiktok_verifier", code_verifier, httponly=True, secure=True, samesite="Lax", max_age=600)
     return resp
 
 
@@ -1026,7 +1026,7 @@ def youtube_auth():
         f"&state={state}"
     )
     resp = redirect(auth_url)
-    resp.set_cookie("youtube_state", state, httponly=True, secure=True, samesite="Strict", max_age=600)
+    resp.set_cookie("youtube_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
     return resp
 
 
@@ -1112,7 +1112,7 @@ def instagram_auth():
         f"&state={state}"
     )
     resp = redirect(auth_url)
-    resp.set_cookie("instagram_state", state, httponly=True, secure=True, samesite="Strict", max_age=600)
+    resp.set_cookie("instagram_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
     return resp
 
 
