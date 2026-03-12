@@ -380,22 +380,26 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
     user_msg = PILLAR_PREFIXES.get(pillar, "") + topic
 
     if GEMINI_API_KEY:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-            headers={"content-type": "application/json"},
-            json={
-                "system_instruction": {"parts": [{"text": CLIPLORE_SYSTEM_PROMPT}]},
-                "contents": [{"parts": [{"text": user_msg}]}],
-                "generationConfig": {"maxOutputTokens": 1024},
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            log.error("Gemini API error %s: %s", resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+                headers={"content-type": "application/json"},
+                json={
+                    "system_instruction": {"parts": [{"text": CLIPLORE_SYSTEM_PROMPT}]},
+                    "contents": [{"parts": [{"text": user_msg}]}],
+                    "generationConfig": {"maxOutputTokens": 1024},
+                },
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            log.warning("Gemini API error %s — falling back to Claude", resp.status_code)
+        except Exception as exc:
+            log.warning("Gemini request failed (%s) — falling back to Claude", exc)
 
     # Fallback to Anthropic Claude
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("No working AI backend: Gemini failed and ANTHROPIC_API_KEY is not set")
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
