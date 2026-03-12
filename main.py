@@ -132,6 +132,38 @@ _instagram_token_store = _load_platform_tokens("instagram_tokens.enc")
 def _save_instagram_tokens():
     _save_platform_tokens("instagram_tokens.enc", _instagram_token_store)
 
+# Server-side OAuth state store (cookies are unreliable across redirects)
+_OAUTH_STATE_FILE = TEMP_DIR / "oauth_states.json"
+_OAUTH_STATE_TTL = 600  # 10 minutes
+
+
+def _save_oauth_state(platform: str, state: str, extras: dict | None = None):
+    """Persist an OAuth state token server-side (keyed by platform)."""
+    data = {}
+    try:
+        if _OAUTH_STATE_FILE.exists():
+            data = json.loads(_OAUTH_STATE_FILE.read_text())
+    except Exception:
+        pass
+    data[platform] = {"state": state, "ts": time.time(), **(extras or {})}
+    _OAUTH_STATE_FILE.write_text(json.dumps(data))
+
+
+def _pop_oauth_state(platform: str) -> dict | None:
+    """Retrieve and delete a stored OAuth state. Returns None if missing/expired."""
+    try:
+        if not _OAUTH_STATE_FILE.exists():
+            return None
+        data = json.loads(_OAUTH_STATE_FILE.read_text())
+        entry = data.pop(platform, None)
+        _OAUTH_STATE_FILE.write_text(json.dumps(data))
+        if entry and (time.time() - entry.get("ts", 0)) < _OAUTH_STATE_TTL:
+            return entry
+    except Exception:
+        pass
+    return None
+
+
 # Temporary video serving for Instagram (needs public URL)
 _tmp_video_tokens: dict = {}  # {token: (file_path, expires_at)}
 
@@ -891,10 +923,8 @@ def tiktok_auth():
         f"&code_challenge_method=S256"
     )
 
-    resp = redirect(auth_url)
-    resp.set_cookie("tiktok_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
-    resp.set_cookie("tiktok_verifier", code_verifier, httponly=True, secure=True, samesite="Lax", max_age=600)
-    return resp
+    _save_oauth_state("tiktok", state, {"code_verifier": code_verifier})
+    return redirect(auth_url)
 
 
 @app.route("/tiktok/callback")
@@ -906,11 +936,11 @@ def tiktok_callback():
     if error:
         return jsonify({"error": error, "description": request.args.get("error_description", "")}), 400
 
-    saved_state = request.cookies.get("tiktok_state", "")
-    if not state or state != saved_state:
+    stored = _pop_oauth_state("tiktok")
+    if not stored or not state or state != stored.get("state"):
         return jsonify({"error": "State mismatch — possible CSRF. Try /tiktok/auth again."}), 403
 
-    code_verifier = request.cookies.get("tiktok_verifier", "")
+    code_verifier = stored.get("code_verifier", "")
 
     try:
         token_resp = requests.post(
@@ -1025,9 +1055,8 @@ def youtube_auth():
         f"&prompt=consent"
         f"&state={state}"
     )
-    resp = redirect(auth_url)
-    resp.set_cookie("youtube_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
-    return resp
+    _save_oauth_state("youtube", state)
+    return redirect(auth_url)
 
 
 @app.route("/youtube/callback")
@@ -1039,8 +1068,8 @@ def youtube_callback():
     if error:
         return jsonify({"error": error}), 400
 
-    saved_state = request.cookies.get("youtube_state", "")
-    if not state or state != saved_state:
+    stored = _pop_oauth_state("youtube")
+    if not stored or not state or state != stored.get("state"):
         return jsonify({"error": "State mismatch — possible CSRF. Try /youtube/auth again."}), 403
 
     try:
@@ -1111,9 +1140,8 @@ def instagram_auth():
         f"&response_type=code"
         f"&state={state}"
     )
-    resp = redirect(auth_url)
-    resp.set_cookie("instagram_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
-    return resp
+    _save_oauth_state("instagram", state)
+    return redirect(auth_url)
 
 
 @app.route("/instagram/callback")
@@ -1125,8 +1153,8 @@ def instagram_callback():
     if error:
         return jsonify({"error": error, "description": request.args.get("error_description", "")}), 400
 
-    saved_state = request.cookies.get("instagram_state", "")
-    if not state or state != saved_state:
+    stored = _pop_oauth_state("instagram")
+    if not stored or not state or state != stored.get("state"):
         return jsonify({"error": "State mismatch — possible CSRF. Try /instagram/auth again."}), 403
 
     try:
