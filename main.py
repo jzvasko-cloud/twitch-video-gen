@@ -1393,8 +1393,6 @@ def pipeline():
 
     if not topic or not streamers:
         return jsonify({"error": "topic and streamers are required"}), 400
-    if not tiktok_token:
-        return jsonify({"error": "No tiktok_access_token and no stored token. Visit /tiktok/auth first."}), 401
 
     return _run_pipeline(topic, pillar, streamers, tiktok_token, description)
 
@@ -1403,8 +1401,6 @@ def pipeline():
 @require_api_key
 def cron():
     tiktok_token = _get_tiktok_token()
-    if not tiktok_token:
-        return jsonify({"error": "TikTok not authenticated. Visit /tiktok/auth first."}), 401
 
     data = request.get_json(silent=True) or {}
     streamers = data.get("streamers", random.sample(DEFAULT_STREAMERS, min(3, len(DEFAULT_STREAMERS))))
