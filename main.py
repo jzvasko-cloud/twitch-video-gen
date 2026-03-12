@@ -42,6 +42,7 @@ log = logging.getLogger("cliplore")
 # ---------------------------------------------------------------------------
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://twitch-video-gen.onrender.com")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
@@ -375,8 +376,26 @@ Return ONLY the script text. Include [VISUAL] tags inline. Include [PAUSE] tags 
 # ===================================================================
 
 def generate_script_text(topic: str, pillar: str = "") -> str:
-    """Call Claude to generate a TikTok commentary script."""
+    """Call Gemini (free) or Claude to generate a TikTok commentary script."""
     user_msg = PILLAR_PREFIXES.get(pillar, "") + topic
+
+    if GEMINI_API_KEY:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            headers={"content-type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": CLIPLORE_SYSTEM_PROMPT}]},
+                "contents": [{"parts": [{"text": user_msg}]}],
+                "generationConfig": {"maxOutputTokens": 1024},
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            log.error("Gemini API error %s: %s", resp.status_code, resp.text[:500])
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    # Fallback to Anthropic Claude
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
