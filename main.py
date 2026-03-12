@@ -22,6 +22,7 @@ import base64
 from pathlib import Path
 
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request, jsonify, redirect, abort
 from gtts import gTTS
 
@@ -46,6 +47,10 @@ TIKTOK_REDIRECT_URI = f"{SELF_URL}/tiktok/callback"
 API_SECRET = os.environ.get("CLIPLORE_API_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
+# Fail fast: require API secret in production to prevent open endpoints
+if not API_SECRET and os.environ.get("RENDER"):
+    raise RuntimeError("CLIPLORE_API_SECRET must be set in production")
+
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
 
 TEMP_DIR = Path(tempfile.gettempdir()) / "cliplore"
@@ -66,24 +71,35 @@ VALID_PILLARS = set(PILLAR_PREFIXES.keys()) | {""}
 DEFAULT_STREAMERS = ["xqc", "pokimane", "asmongold", "hasanabi", "shroud", "nickmercs", "timthetatman"]
 
 # ---------------------------------------------------------------------------
-# TikTok token store (persisted to disk)
+# TikTok token store (encrypted on disk)
 # ---------------------------------------------------------------------------
-TOKEN_FILE = TEMP_DIR / "tiktok_tokens.json"
+TOKEN_FILE = TEMP_DIR / "tiktok_tokens.enc"
+
+# Derive a Fernet key from the API secret (or a fallback for local dev)
+_token_key_material = (API_SECRET or "local-dev-key-not-secure").encode()
+_token_fernet_key = base64.urlsafe_b64encode(
+    hashlib.sha256(_token_key_material).digest()
+)
+_token_cipher = Fernet(_token_fernet_key)
 
 
 def _load_tokens() -> dict:
     default = {"access_token": None, "refresh_token": None, "expires_at": 0, "open_id": None}
     try:
         if TOKEN_FILE.exists():
-            default.update(json.loads(TOKEN_FILE.read_text()))
-    except Exception as e:
-        log.warning("Failed to load token file: %s", e)
+            decrypted = _token_cipher.decrypt(TOKEN_FILE.read_bytes())
+            default.update(json.loads(decrypted))
+    except (InvalidToken, Exception) as e:
+        log.warning("Failed to load token file (may need re-auth): %s", type(e).__name__)
+        TOKEN_FILE.unlink(missing_ok=True)
     return default
 
 
 def _save_tokens():
     try:
-        TOKEN_FILE.write_text(json.dumps(_tiktok_token_store))
+        plaintext = json.dumps(_tiktok_token_store).encode()
+        TOKEN_FILE.write_bytes(_token_cipher.encrypt(plaintext))
+        TOKEN_FILE.chmod(0o600)
     except Exception as e:
         log.warning("Failed to save token file: %s", e)
 
@@ -96,6 +112,12 @@ _tiktok_token_store = _load_tokens()
 _rate_store: dict = {}
 RATE_LIMIT = 30
 RATE_WINDOW = 60
+
+# Stricter per-endpoint limits for expensive operations
+_heavy_rate_store: dict = {}
+HEAVY_RATE_LIMIT = 3
+HEAVY_RATE_WINDOW = 300  # 3 requests per 5 minutes
+HEAVY_ENDPOINTS = {"/pipeline", "/cron", "/assemble-video"}
 
 _SECRET_PATTERNS: list = []
 
@@ -115,14 +137,34 @@ def _sanitize(msg: str) -> str:
     return msg
 
 
+def _get_client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
 def _check_rate_limit():
-    ip = request.remote_addr or "unknown"
+    ip = _get_client_ip()
     now = time.time()
     hits = [t for t in _rate_store.get(ip, []) if now - t < RATE_WINDOW]
     if len(hits) >= RATE_LIMIT:
         return True
     hits.append(now)
     _rate_store[ip] = hits
+    return False
+
+
+def _check_heavy_rate_limit():
+    if request.path not in HEAVY_ENDPOINTS:
+        return False
+    ip = _get_client_ip()
+    now = time.time()
+    hits = [t for t in _heavy_rate_store.get(ip, []) if now - t < HEAVY_RATE_WINDOW]
+    if len(hits) >= HEAVY_RATE_LIMIT:
+        return True
+    hits.append(now)
+    _heavy_rate_store[ip] = hits
     return False
 
 
@@ -157,11 +199,12 @@ def require_api_key(f):
     @functools.wraps(f)
     def decorated(*args, **kwargs):
         if not API_SECRET:
-            return f(*args, **kwargs)
+            log.error("API_SECRET not set — rejecting request to %s", request.path)
+            return jsonify({"error": "Server misconfigured (no API secret)"}), 500
         key = request.headers.get("X-Api-Key", "")
         if not key and request.is_json:
             key = (request.get_json(silent=True) or {}).get("api_key", "")
-        if key != API_SECRET:
+        if not secrets.compare_digest(key, API_SECRET):
             log.warning("Unauthorized request to %s from %s", request.path, request.remote_addr)
             return jsonify({"error": "Unauthorized"}), 401
         return f(*args, **kwargs)
@@ -175,7 +218,9 @@ def require_api_key(f):
 def _security_checks():
     if _check_rate_limit():
         return jsonify({"error": "Rate limit exceeded. Try again later."}), 429
-    log.info("%s %s from %s", request.method, request.path, request.remote_addr)
+    if _check_heavy_rate_limit():
+        return jsonify({"error": "Too many expensive requests. Try again in a few minutes."}), 429
+    log.info("%s %s from %s", request.method, request.path, _get_client_ip())
 
 
 @app.after_request
@@ -185,7 +230,7 @@ def _security_headers(response):
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'unsafe-inline'"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self'; img-src 'none'; script-src 'none'"
     origin = request.headers.get("Origin", "")
     allowed_origins = {SELF_URL, "https://twitch-video-gen.onrender.com"}
     if origin in allowed_origins:
@@ -524,9 +569,15 @@ def _get_tiktok_token():
                 _tiktok_token_store["refresh_token"] = td.get("refresh_token", _tiktok_token_store["refresh_token"])
                 _tiktok_token_store["expires_at"] = time.time() + td.get("expires_in", 86400)
                 _save_tokens()
-        except Exception:
-            pass
-    return _tiktok_token_store.get("access_token")
+            else:
+                log.warning("TikTok refresh response missing access_token")
+        except Exception as e:
+            log.error("TikTok token refresh failed: %s", _sanitize(str(e)))
+    token = _tiktok_token_store.get("access_token")
+    if token and _tiktok_token_store["expires_at"] - time.time() <= 0:
+        log.warning("TikTok token expired and refresh failed — returning None")
+        return None
+    return token
 
 
 # ===================================================================
@@ -676,8 +727,8 @@ def tiktok_auth():
     )
 
     resp = redirect(auth_url)
-    resp.set_cookie("tiktok_state", state, httponly=True, secure=True, samesite="Lax", max_age=600)
-    resp.set_cookie("tiktok_verifier", code_verifier, httponly=True, secure=True, samesite="Lax", max_age=600)
+    resp.set_cookie("tiktok_state", state, httponly=True, secure=True, samesite="Strict", max_age=600)
+    resp.set_cookie("tiktok_verifier", code_verifier, httponly=True, secure=True, samesite="Strict", max_age=600)
     return resp
 
 
@@ -714,7 +765,8 @@ def tiktok_callback():
         token_data = token_resp.json()
 
         if "access_token" not in token_data:
-            return jsonify({"error": "No access_token in response", "raw": token_data}), 502
+            log.error("TikTok token exchange missing access_token: %s", _sanitize(str(token_data)))
+            return jsonify({"error": "No access_token in response. Check TikTok app configuration."}), 502
 
         _tiktok_token_store["access_token"] = token_data["access_token"]
         _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", "")
@@ -759,7 +811,8 @@ def tiktok_refresh():
         token_data = resp.json()
 
         if "access_token" not in token_data:
-            return jsonify({"error": "Refresh failed", "raw": token_data}), 502
+            log.error("TikTok refresh missing access_token: %s", _sanitize(str(token_data)))
+            return jsonify({"error": "Refresh failed. Try /tiktok/auth again."}), 502
 
         _tiktok_token_store["access_token"] = token_data["access_token"]
         _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", refresh_token)
@@ -987,17 +1040,23 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
         return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
 
     # Step 4: Post to TikTok
+    tiktok_ok = False
     try:
         publish_id = upload_to_tiktok(video_path, tiktok_token, description)
         results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id}
+        tiktok_ok = True
     except Exception as e:
         results["steps"]["tiktok"] = {"status": "error", "error": _sanitize(str(e))}
 
-    # Cleanup
-    try:
-        shutil.rmtree(video_path.parent, ignore_errors=True)
-    except Exception:
-        pass
+    # Cleanup — keep video if upload failed so it can be retried
+    if tiktok_ok:
+        try:
+            shutil.rmtree(video_path.parent, ignore_errors=True)
+        except Exception:
+            pass
+    else:
+        results["steps"]["tiktok"]["video_path"] = str(video_path)
+        log.warning("TikTok upload failed — keeping video at %s for retry", video_path)
 
     log.info("Pipeline done: topic=%s tiktok=%s", topic[:50], results["steps"].get("tiktok", {}).get("status"))
     return jsonify(results)
