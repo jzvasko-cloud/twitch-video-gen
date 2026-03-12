@@ -1,6 +1,6 @@
 """
 ClipLoreTV Auto-Post Service
-Flask backend for automated Twitch clip -> TikTok video pipeline.
+Flask backend for automated Twitch clip -> TikTok/YouTube/Instagram video pipeline.
 """
 
 import os
@@ -23,7 +23,10 @@ from pathlib import Path
 
 import requests
 from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, request, jsonify, redirect, abort
+from flask import Flask, request, jsonify, redirect, abort, send_file
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from gtts import gTTS
 
 app = Flask(__name__)
@@ -44,6 +47,13 @@ TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
 TIKTOK_REDIRECT_URI = f"{SELF_URL}/tiktok/callback"
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = f"{SELF_URL}/youtube/callback"
+META_APP_ID = os.environ.get("META_APP_ID", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_BUSINESS_ACCOUNT_ID", "")
+META_REDIRECT_URI = f"{SELF_URL}/instagram/callback"
 API_SECRET = os.environ.get("CLIPLORE_API_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
@@ -71,40 +81,59 @@ VALID_PILLARS = set(PILLAR_PREFIXES.keys()) | {""}
 DEFAULT_STREAMERS = ["xqc", "pokimane", "asmongold", "hasanabi", "shroud", "nickmercs", "timthetatman"]
 
 # ---------------------------------------------------------------------------
-# TikTok token store (encrypted on disk)
+# Encrypted token storage (shared by TikTok, YouTube, Instagram)
 # ---------------------------------------------------------------------------
-TOKEN_FILE = TEMP_DIR / "tiktok_tokens.enc"
-
-# Derive a Fernet key from the API secret (or a fallback for local dev)
 _token_key_material = (API_SECRET or "local-dev-key-not-secure").encode()
 _token_fernet_key = base64.urlsafe_b64encode(
     hashlib.sha256(_token_key_material).digest()
 )
 _token_cipher = Fernet(_token_fernet_key)
 
+_TOKEN_DEFAULTS = {"access_token": None, "refresh_token": None, "expires_at": 0}
 
-def _load_tokens() -> dict:
-    default = {"access_token": None, "refresh_token": None, "expires_at": 0, "open_id": None}
+
+def _load_platform_tokens(filename: str, extra_defaults: dict | None = None) -> dict:
+    default = {**_TOKEN_DEFAULTS, **(extra_defaults or {})}
+    fpath = TEMP_DIR / filename
     try:
-        if TOKEN_FILE.exists():
-            decrypted = _token_cipher.decrypt(TOKEN_FILE.read_bytes())
+        if fpath.exists():
+            decrypted = _token_cipher.decrypt(fpath.read_bytes())
             default.update(json.loads(decrypted))
     except (InvalidToken, Exception) as e:
-        log.warning("Failed to load token file (may need re-auth): %s", type(e).__name__)
-        TOKEN_FILE.unlink(missing_ok=True)
+        log.warning("Failed to load %s (may need re-auth): %s", filename, type(e).__name__)
+        fpath.unlink(missing_ok=True)
     return default
 
 
-def _save_tokens():
+def _save_platform_tokens(filename: str, store: dict):
+    fpath = TEMP_DIR / filename
     try:
-        plaintext = json.dumps(_tiktok_token_store).encode()
-        TOKEN_FILE.write_bytes(_token_cipher.encrypt(plaintext))
-        TOKEN_FILE.chmod(0o600)
+        fpath.write_bytes(_token_cipher.encrypt(json.dumps(store).encode()))
+        fpath.chmod(0o600)
     except Exception as e:
-        log.warning("Failed to save token file: %s", e)
+        log.warning("Failed to save %s: %s", filename, e)
 
 
-_tiktok_token_store = _load_tokens()
+# TikTok tokens
+_tiktok_token_store = _load_platform_tokens("tiktok_tokens.enc", {"open_id": None})
+
+def _save_tiktok_tokens():
+    _save_platform_tokens("tiktok_tokens.enc", _tiktok_token_store)
+
+# YouTube tokens
+_youtube_token_store = _load_platform_tokens("youtube_tokens.enc")
+
+def _save_youtube_tokens():
+    _save_platform_tokens("youtube_tokens.enc", _youtube_token_store)
+
+# Instagram tokens
+_instagram_token_store = _load_platform_tokens("instagram_tokens.enc")
+
+def _save_instagram_tokens():
+    _save_platform_tokens("instagram_tokens.enc", _instagram_token_store)
+
+# Temporary video serving for Instagram (needs public URL)
+_tmp_video_tokens: dict = {}  # {token: (file_path, expires_at)}
 
 # ---------------------------------------------------------------------------
 # Security helpers
@@ -502,6 +531,142 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
     return publish_id
 
 
+def _get_youtube_credentials():
+    """Build Google OAuth credentials from stored tokens, refreshing if needed."""
+    token = _youtube_token_store.get("access_token")
+    refresh = _youtube_token_store.get("refresh_token")
+    if not token:
+        return None
+
+    creds = Credentials(
+        token=token,
+        refresh_token=refresh,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+    )
+    if _youtube_token_store["expires_at"] - time.time() <= 60 and refresh:
+        try:
+            resp = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "refresh_token": refresh,
+                    "grant_type": "refresh_token",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            td = resp.json()
+            _youtube_token_store["access_token"] = td["access_token"]
+            _youtube_token_store["expires_at"] = time.time() + td.get("expires_in", 3600)
+            _save_youtube_tokens()
+            creds = Credentials(
+                token=td["access_token"],
+                refresh_token=refresh,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=GOOGLE_CLIENT_ID,
+                client_secret=GOOGLE_CLIENT_SECRET,
+            )
+        except Exception as e:
+            log.error("YouTube token refresh failed: %s", _sanitize(str(e)))
+    return creds
+
+
+def upload_to_youtube(video_path: Path, title: str = "", description: str = "") -> str:
+    """Upload video to YouTube Shorts. Returns video ID."""
+    creds = _get_youtube_credentials()
+    if not creds:
+        raise ValueError("YouTube not authenticated. Visit /youtube/auth first.")
+
+    youtube = build("youtube", "v3", credentials=creds)
+    body = {
+        "snippet": {
+            "title": (title[:100]) if title else "ClipLoreTV #Shorts",
+            "description": description or "#twitch #gaming #shorts #cliploretv",
+            "tags": ["twitch", "gaming", "shorts", "cliploretv"],
+            "categoryId": "20",  # Gaming
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
+    req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+    response = None
+    while response is None:
+        status, response = req.next_chunk()
+        if status:
+            log.info("YouTube upload progress: %d%%", int(status.progress() * 100))
+
+    video_id = response["id"]
+    log.info("YouTube upload complete: video_id=%s", video_id)
+    return video_id
+
+
+def upload_to_instagram(video_path: Path, description: str = "") -> str:
+    """Upload video as Instagram Reel. Returns media ID."""
+    access_token = _instagram_token_store.get("access_token")
+    if not access_token:
+        raise ValueError("Instagram not authenticated. Visit /instagram/auth first.")
+    if not INSTAGRAM_ACCOUNT_ID:
+        raise ValueError("INSTAGRAM_BUSINESS_ACCOUNT_ID not set")
+
+    # Create a temporary public URL for the video
+    video_url = _create_tmp_video_url(video_path, ttl=600)
+
+    # Step 1: Create media container
+    container_resp = requests.post(
+        f"https://graph.facebook.com/v21.0/{INSTAGRAM_ACCOUNT_ID}/media",
+        data={
+            "media_type": "REELS",
+            "video_url": video_url,
+            "caption": description or "#twitch #gaming #reels #cliploretv",
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    container_resp.raise_for_status()
+    container_id = container_resp.json().get("id")
+    if not container_id:
+        raise ValueError("Instagram container creation failed")
+
+    # Step 2: Poll until container is ready
+    for _ in range(30):  # max ~5 minutes of polling
+        time.sleep(10)
+        status_resp = requests.get(
+            f"https://graph.facebook.com/v21.0/{container_id}",
+            params={"fields": "status_code", "access_token": access_token},
+            timeout=10,
+        )
+        status_resp.raise_for_status()
+        status_code = status_resp.json().get("status_code", "")
+        if status_code == "FINISHED":
+            break
+        if status_code == "ERROR":
+            raise ValueError("Instagram container processing failed")
+        log.info("Instagram container status: %s", status_code)
+    else:
+        raise ValueError("Instagram container processing timed out")
+
+    # Step 3: Publish
+    publish_resp = requests.post(
+        f"https://graph.facebook.com/v21.0/{INSTAGRAM_ACCOUNT_ID}/media_publish",
+        data={
+            "creation_id": container_id,
+            "access_token": access_token,
+        },
+        timeout=30,
+    )
+    publish_resp.raise_for_status()
+    media_id = publish_resp.json().get("id", "")
+    log.info("Instagram Reel published: media_id=%s", media_id)
+    return media_id
+
+
 # ===================================================================
 #  Twitch helpers
 # ===================================================================
@@ -568,7 +733,7 @@ def _get_tiktok_token():
                 _tiktok_token_store["access_token"] = td["access_token"]
                 _tiktok_token_store["refresh_token"] = td.get("refresh_token", _tiktok_token_store["refresh_token"])
                 _tiktok_token_store["expires_at"] = time.time() + td.get("expires_in", 86400)
-                _save_tokens()
+                _save_tiktok_tokens()
             else:
                 log.warning("TikTok refresh response missing access_token")
         except Exception as e:
@@ -772,7 +937,7 @@ def tiktok_callback():
         _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", "")
         _tiktok_token_store["expires_at"] = time.time() + token_data.get("expires_in", 86400)
         _tiktok_token_store["open_id"] = token_data.get("open_id", "")
-        _save_tokens()
+        _save_tiktok_tokens()
 
         hours = token_data.get("expires_in", 0) // 3600
         return f"""<!DOCTYPE html>
@@ -817,7 +982,7 @@ def tiktok_refresh():
         _tiktok_token_store["access_token"] = token_data["access_token"]
         _tiktok_token_store["refresh_token"] = token_data.get("refresh_token", refresh_token)
         _tiktok_token_store["expires_at"] = time.time() + token_data.get("expires_in", 86400)
-        _save_tokens()
+        _save_tiktok_tokens()
 
         return jsonify({"status": "refreshed", "expires_in": token_data.get("expires_in", 0)})
     except requests.RequestException as e:
@@ -837,6 +1002,218 @@ def tiktok_status():
         "expires_in_seconds": max(0, int(remaining)),
         "expired": remaining <= 0,
     })
+
+
+# ===================================================================
+#  YouTube OAuth routes
+# ===================================================================
+YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube.upload"
+
+
+@app.route("/youtube/auth")
+def youtube_auth():
+    if not GOOGLE_CLIENT_ID:
+        return jsonify({"error": "Google OAuth not configured"}), 500
+    state = secrets.token_urlsafe(16)
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope={YOUTUBE_SCOPES}"
+        f"&access_type=offline"
+        f"&prompt=consent"
+        f"&state={state}"
+    )
+    resp = redirect(auth_url)
+    resp.set_cookie("youtube_state", state, httponly=True, secure=True, samesite="Strict", max_age=600)
+    return resp
+
+
+@app.route("/youtube/callback")
+def youtube_callback():
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    error = request.args.get("error", "")
+
+    if error:
+        return jsonify({"error": error}), 400
+
+    saved_state = request.cookies.get("youtube_state", "")
+    if not state or state != saved_state:
+        return jsonify({"error": "State mismatch — possible CSRF. Try /youtube/auth again."}), 403
+
+    try:
+        token_resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+            },
+            timeout=15,
+        )
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+
+        if "access_token" not in token_data:
+            log.error("YouTube token exchange missing access_token: %s", _sanitize(str(token_data)))
+            return jsonify({"error": "No access_token in response. Check Google app configuration."}), 502
+
+        _youtube_token_store["access_token"] = token_data["access_token"]
+        _youtube_token_store["refresh_token"] = token_data.get("refresh_token", _youtube_token_store.get("refresh_token", ""))
+        _youtube_token_store["expires_at"] = time.time() + token_data.get("expires_in", 3600)
+        _save_youtube_tokens()
+
+        return f"""<!DOCTYPE html>
+<html><head><title>ClipLoreTV — YouTube Connected</title></head>
+<body style="font-family:system-ui;max-width:600px;margin:80px auto;text-align:center">
+<h1>YouTube Connected!</h1>
+<p>Access token stored. Videos will now auto-post to YouTube Shorts.</p>
+<p><a href="/youtube/status">Check token status</a></p>
+</body></html>"""
+
+    except requests.RequestException as e:
+        return jsonify({"error": f"Token exchange failed: {_sanitize(str(e))}"}), 502
+
+
+@app.route("/youtube/status")
+def youtube_status():
+    token = _youtube_token_store.get("access_token")
+    if not token:
+        return jsonify({"authenticated": False, "message": "No token. Visit /youtube/auth to connect."})
+    remaining = _youtube_token_store["expires_at"] - time.time()
+    return jsonify({
+        "authenticated": True,
+        "expires_in_seconds": max(0, int(remaining)),
+        "expired": remaining <= 0,
+    })
+
+
+# ===================================================================
+#  Instagram OAuth routes
+# ===================================================================
+INSTAGRAM_PERMISSIONS = "instagram_basic,instagram_content_publish,pages_read_engagement"
+
+
+@app.route("/instagram/auth")
+def instagram_auth():
+    if not META_APP_ID:
+        return jsonify({"error": "Meta/Instagram OAuth not configured"}), 500
+    state = secrets.token_urlsafe(16)
+    auth_url = (
+        "https://www.facebook.com/v21.0/dialog/oauth"
+        f"?client_id={META_APP_ID}"
+        f"&redirect_uri={META_REDIRECT_URI}"
+        f"&scope={INSTAGRAM_PERMISSIONS}"
+        f"&response_type=code"
+        f"&state={state}"
+    )
+    resp = redirect(auth_url)
+    resp.set_cookie("instagram_state", state, httponly=True, secure=True, samesite="Strict", max_age=600)
+    return resp
+
+
+@app.route("/instagram/callback")
+def instagram_callback():
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    error = request.args.get("error", "")
+
+    if error:
+        return jsonify({"error": error, "description": request.args.get("error_description", "")}), 400
+
+    saved_state = request.cookies.get("instagram_state", "")
+    if not state or state != saved_state:
+        return jsonify({"error": "State mismatch — possible CSRF. Try /instagram/auth again."}), 403
+
+    try:
+        # Exchange code for short-lived token
+        token_resp = requests.post(
+            "https://graph.facebook.com/v21.0/oauth/access_token",
+            data={
+                "client_id": META_APP_ID,
+                "client_secret": META_APP_SECRET,
+                "code": code,
+                "redirect_uri": META_REDIRECT_URI,
+            },
+            timeout=15,
+        )
+        token_resp.raise_for_status()
+        short_token = token_resp.json().get("access_token", "")
+
+        if not short_token:
+            log.error("Instagram token exchange failed: %s", _sanitize(str(token_resp.json())))
+            return jsonify({"error": "No access_token in response."}), 502
+
+        # Exchange for long-lived token (~60 days)
+        ll_resp = requests.get(
+            "https://graph.facebook.com/v21.0/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": META_APP_ID,
+                "client_secret": META_APP_SECRET,
+                "fb_exchange_token": short_token,
+            },
+            timeout=15,
+        )
+        ll_resp.raise_for_status()
+        ll_data = ll_resp.json()
+
+        _instagram_token_store["access_token"] = ll_data.get("access_token", short_token)
+        _instagram_token_store["expires_at"] = time.time() + ll_data.get("expires_in", 5184000)
+        _save_instagram_tokens()
+
+        return f"""<!DOCTYPE html>
+<html><head><title>ClipLoreTV — Instagram Connected</title></head>
+<body style="font-family:system-ui;max-width:600px;margin:80px auto;text-align:center">
+<h1>Instagram Connected!</h1>
+<p>Long-lived token stored. Videos will now auto-post as Reels.</p>
+<p><a href="/instagram/status">Check token status</a></p>
+</body></html>"""
+
+    except requests.RequestException as e:
+        return jsonify({"error": f"Token exchange failed: {_sanitize(str(e))}"}), 502
+
+
+@app.route("/instagram/status")
+def instagram_status():
+    token = _instagram_token_store.get("access_token")
+    if not token:
+        return jsonify({"authenticated": False, "message": "No token. Visit /instagram/auth to connect."})
+    remaining = _instagram_token_store["expires_at"] - time.time()
+    return jsonify({
+        "authenticated": True,
+        "ig_account_id": INSTAGRAM_ACCOUNT_ID or "(not set)",
+        "expires_in_seconds": max(0, int(remaining)),
+        "expired": remaining <= 0,
+    })
+
+
+# ===================================================================
+#  Temporary video serving (for Instagram which requires a public URL)
+# ===================================================================
+@app.route("/tmp-video/<serve_token>")
+def serve_tmp_video(serve_token):
+    entry = _tmp_video_tokens.get(serve_token)
+    if not entry:
+        return jsonify({"error": "Not found or expired"}), 404
+    file_path, expires_at = entry
+    if time.time() > expires_at:
+        _tmp_video_tokens.pop(serve_token, None)
+        return jsonify({"error": "Link expired"}), 410
+    resolved = Path(file_path).resolve()
+    if not str(resolved).startswith(str(TEMP_DIR.resolve())) or not resolved.exists():
+        return jsonify({"error": "File not found"}), 404
+    return send_file(str(resolved), mimetype="video/mp4")
+
+
+def _create_tmp_video_url(video_path: Path, ttl: int = 600) -> str:
+    token = secrets.token_urlsafe(32)
+    _tmp_video_tokens[token] = (str(video_path), time.time() + ttl)
+    return f"{SELF_URL}/tmp-video/{token}"
 
 
 # ===================================================================
@@ -1039,26 +1416,56 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
     except Exception as e:
         return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
 
-    # Step 4: Post to TikTok
-    tiktok_ok = False
-    try:
-        publish_id = upload_to_tiktok(video_path, tiktok_token, description)
-        results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id}
-        tiktok_ok = True
-    except Exception as e:
-        results["steps"]["tiktok"] = {"status": "error", "error": _sanitize(str(e))}
+    # Step 4: Post to platforms (each independent — one failure doesn't block others)
+    all_ok = True
+    short_title = topic[:100] if topic else "ClipLoreTV"
 
-    # Cleanup — keep video if upload failed so it can be retried
-    if tiktok_ok:
+    # 4a: TikTok
+    if tiktok_token:
+        try:
+            publish_id = upload_to_tiktok(video_path, tiktok_token, description)
+            results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id}
+        except Exception as e:
+            results["steps"]["tiktok"] = {"status": "error", "error": _sanitize(str(e))}
+            all_ok = False
+    else:
+        results["steps"]["tiktok"] = {"status": "skipped", "reason": "No TikTok token"}
+
+    # 4b: YouTube Shorts
+    yt_creds = _get_youtube_credentials()
+    if yt_creds:
+        try:
+            video_id = upload_to_youtube(video_path, title=short_title, description=description)
+            results["steps"]["youtube"] = {"status": "ok", "video_id": video_id}
+        except Exception as e:
+            results["steps"]["youtube"] = {"status": "error", "error": _sanitize(str(e))}
+            all_ok = False
+    else:
+        results["steps"]["youtube"] = {"status": "skipped", "reason": "No YouTube token"}
+
+    # 4c: Instagram Reels
+    if _instagram_token_store.get("access_token") and INSTAGRAM_ACCOUNT_ID:
+        try:
+            media_id = upload_to_instagram(video_path, description=description)
+            results["steps"]["instagram"] = {"status": "ok", "media_id": media_id}
+        except Exception as e:
+            results["steps"]["instagram"] = {"status": "error", "error": _sanitize(str(e))}
+            all_ok = False
+    else:
+        results["steps"]["instagram"] = {"status": "skipped", "reason": "No Instagram token or account ID"}
+
+    # Cleanup — keep video if any upload failed so it can be retried
+    if all_ok:
         try:
             shutil.rmtree(video_path.parent, ignore_errors=True)
         except Exception:
             pass
     else:
-        results["steps"]["tiktok"]["video_path"] = str(video_path)
-        log.warning("TikTok upload failed — keeping video at %s for retry", video_path)
+        results["video_path"] = str(video_path)
+        log.warning("Some uploads failed — keeping video at %s for retry", video_path)
 
-    log.info("Pipeline done: topic=%s tiktok=%s", topic[:50], results["steps"].get("tiktok", {}).get("status"))
+    platforms = {k: v.get("status") for k, v in results["steps"].items() if k in ("tiktok", "youtube", "instagram")}
+    log.info("Pipeline done: topic=%s platforms=%s", topic[:50], platforms)
     return jsonify(results)
 
 
