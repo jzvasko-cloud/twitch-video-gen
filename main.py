@@ -482,7 +482,8 @@ def assemble_video_from_parts(script_text: str, clip_urls: list) -> tuple:
                 for chunk in r.iter_content(8192):
                     f.write(chunk)
             clip_paths.append(cp)
-        except Exception:
+        except Exception as exc:
+            log.warning("Clip download failed for %s: %s", url[:80], exc)
             continue
 
     if not clip_paths:
