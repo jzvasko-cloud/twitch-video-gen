@@ -393,7 +393,7 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
             )
             if resp.status_code == 200:
                 return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            log.warning("Gemini API error %s — falling back to Claude", resp.status_code)
+            log.warning("Gemini API error %s: %s — falling back to Claude", resp.status_code, resp.text[:300])
         except Exception as exc:
             log.warning("Gemini request failed (%s) — falling back to Claude", exc)
 
