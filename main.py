@@ -902,7 +902,40 @@ def _pick_topic() -> tuple:
 # ===================================================================
 @app.route("/")
 def home():
-    return "ClipLoreTV Auto-Post Service is running."
+    return """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClipLoreTV</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0e0e10;color:#efeff1;min-height:100vh;display:flex;flex-direction:column;align-items:center}
+header{width:100%;background:#18181b;padding:1rem 2rem;text-align:center;border-bottom:2px solid #9147ff}
+header h1{font-size:1.8rem;color:#9147ff}
+header p{color:#adadb8;margin-top:.3rem}
+main{max-width:700px;padding:2rem 1.5rem;flex:1}
+h2{color:#bf94ff;margin:1.5rem 0 .5rem;font-size:1.2rem}
+p,li{line-height:1.7;color:#dedee3;margin-bottom:.5rem}
+ul{padding-left:1.2rem}
+a{color:#9147ff;text-decoration:none}a:hover{text-decoration:underline}
+footer{width:100%;text-align:center;padding:1.5rem;color:#636369;font-size:.85rem;border-top:1px solid #26262c}
+</style></head><body>
+<header><h1>ClipLoreTV</h1><p>Automated gaming highlights for short-form video</p></header>
+<main>
+<h2>What is ClipLoreTV?</h2>
+<p>ClipLoreTV is an automated content pipeline that transforms trending Twitch clips into
+short-form videos with AI-generated commentary. Videos are published to TikTok, YouTube Shorts,
+and Instagram Reels on a regular schedule.</p>
+<h2>How It Works</h2>
+<ul>
+<li>Curates top clips from popular Twitch streamers every 12 hours</li>
+<li>Generates engaging commentary scripts using AI</li>
+<li>Assembles vertical (9:16) videos with text-to-speech narration</li>
+<li>Publishes automatically to connected social media accounts</li>
+</ul>
+<h2>Links</h2>
+<p><a href="/privacy">Privacy Policy</a> &middot; <a href="/tos">Terms of Service</a></p>
+</main>
+<footer>&copy; 2025&ndash;2026 ClipLoreTV. All rights reserved.</footer>
+</body></html>"""
 
 
 @app.route("/health")
@@ -922,41 +955,170 @@ def tiktok_verify():
 @app.route("/tos")
 def tos():
     return """<!DOCTYPE html>
-<html><head><title>Terms of Service - ClipLoreTV</title></head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Terms of Service - ClipLoreTV</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0e0e10;color:#efeff1;max-width:750px;margin:0 auto;padding:2rem 1.5rem;line-height:1.7}
+h1{color:#9147ff;margin-bottom:.3rem}
+h2{color:#bf94ff;margin:1.5rem 0 .5rem;font-size:1.1rem}
+p,li{color:#dedee3;margin-bottom:.5rem}
+ul{padding-left:1.2rem}
+a{color:#9147ff}
+.updated{color:#adadb8;font-size:.9rem;margin-bottom:1.5rem}
+</style></head><body>
 <h1>Terms of Service</h1>
-<p>Last updated: 2025-03-01</p>
-<p>ClipLoreTV Auto-Post is a personal automation tool that posts short gaming
-highlight videos to TikTok from Twitch clips.</p>
-<h2>Usage</h2>
-<p>This service is for personal, non-commercial use by the app developer.
-No user data is collected or stored beyond what is required by the TikTok API
-for authentication and video posting.</p>
-<h2>Content</h2>
-<p>All posted content consists of short highlight clips sourced from publicly
-available Twitch streams, with AI-generated commentary overlaid.</p>
-<h2>Contact</h2>
-<p>For questions, contact the developer via the TikTok developer portal.</p>
+<p class="updated">Last updated: March 13, 2026</p>
+
+<h2>1. Acceptance of Terms</h2>
+<p>By accessing or using ClipLoreTV ("the Service"), you agree to be bound by these Terms
+of Service. If you do not agree, do not use the Service.</p>
+
+<h2>2. Description of Service</h2>
+<p>ClipLoreTV is an automated content pipeline that creates short-form gaming highlight
+videos from publicly available Twitch clips, enhanced with AI-generated commentary.
+Videos are published to third-party platforms including TikTok, YouTube, and Instagram.</p>
+
+<h2>3. Eligibility</h2>
+<p>You must be at least 18 years old to use the Service. By using the Service, you
+represent that you meet this age requirement.</p>
+
+<h2>4. User Accounts and Authentication</h2>
+<p>To enable video publishing, the Service uses OAuth authentication with third-party
+platforms. By connecting your social media accounts, you authorize ClipLoreTV to
+upload video content on your behalf. You may revoke this access at any time through
+the respective platform's settings.</p>
+
+<h2>5. Content and Intellectual Property</h2>
+<ul>
+<li>Twitch clips used by the Service are publicly available content from the Twitch platform.</li>
+<li>AI-generated commentary is original content created by the Service.</li>
+<li>You retain ownership of any content on your connected social media accounts.</li>
+<li>ClipLoreTV does not claim ownership of third-party content.</li>
+</ul>
+
+<h2>6. Prohibited Uses</h2>
+<p>You agree not to:</p>
+<ul>
+<li>Use the Service for any unlawful purpose</li>
+<li>Attempt to interfere with or disrupt the Service</li>
+<li>Reverse-engineer or extract source code from the Service</li>
+<li>Use the Service to distribute spam or misleading content</li>
+</ul>
+
+<h2>7. Disclaimer of Warranties</h2>
+<p>The Service is provided "as is" without warranties of any kind, whether express
+or implied. ClipLoreTV does not guarantee uninterrupted or error-free operation.</p>
+
+<h2>8. Limitation of Liability</h2>
+<p>To the fullest extent permitted by law, ClipLoreTV shall not be liable for any
+indirect, incidental, or consequential damages arising from your use of the Service.</p>
+
+<h2>9. Changes to Terms</h2>
+<p>We reserve the right to modify these Terms at any time. Continued use of the Service
+after changes constitutes acceptance of the updated Terms.</p>
+
+<h2>10. Contact</h2>
+<p>For questions about these Terms, contact us at
+<a href="mailto:cliploretv@gmail.com">cliploretv@gmail.com</a>.</p>
+
+<p style="margin-top:2rem"><a href="/">Back to home</a></p>
 </body></html>"""
 
 
 @app.route("/privacy")
 def privacy():
     return """<!DOCTYPE html>
-<html><head><title>Privacy Policy - ClipLoreTV</title></head>
-<body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy Policy - ClipLoreTV</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0e0e10;color:#efeff1;max-width:750px;margin:0 auto;padding:2rem 1.5rem;line-height:1.7}
+h1{color:#9147ff;margin-bottom:.3rem}
+h2{color:#bf94ff;margin:1.5rem 0 .5rem;font-size:1.1rem}
+p,li{color:#dedee3;margin-bottom:.5rem}
+ul{padding-left:1.2rem}
+a{color:#9147ff}
+.updated{color:#adadb8;font-size:.9rem;margin-bottom:1.5rem}
+</style></head><body>
 <h1>Privacy Policy</h1>
-<p>Last updated: 2025-03-01</p>
-<p>ClipLoreTV Auto-Post does not collect, store, or share any personal data
-from end users.</p>
-<h2>Data We Access</h2>
-<p>The only data accessed is the TikTok API token required for posting videos,
-which is stored securely and never shared with third parties.</p>
-<h2>Third-Party Services</h2>
-<p>This app uses the TikTok Content Posting API solely to upload video content.
-No analytics or tracking services are used.</p>
-<h2>Contact</h2>
-<p>For privacy questions, contact the developer via the TikTok developer portal.</p>
+<p class="updated">Last updated: March 13, 2026</p>
+
+<h2>1. Introduction</h2>
+<p>ClipLoreTV ("we", "our", "the Service") respects your privacy. This Privacy Policy
+explains what data we collect, how we use it, and your rights regarding that data.</p>
+
+<h2>2. Data We Collect</h2>
+<p>ClipLoreTV collects minimal data necessary for operation:</p>
+<ul>
+<li><strong>OAuth Tokens:</strong> When you connect a social media account (TikTok, YouTube,
+Instagram), we store the access token and refresh token required to publish videos on your behalf.</li>
+<li><strong>Server Logs:</strong> Standard web server logs may include IP addresses, request timestamps,
+and HTTP status codes. These are used for debugging and are not shared.</li>
+</ul>
+<p>We do <strong>not</strong> collect personal information such as names, email addresses, browsing
+history, or device identifiers from end users or viewers of published content.</p>
+
+<h2>3. How We Use Your Data</h2>
+<ul>
+<li>OAuth tokens are used solely to upload video content to your connected accounts.</li>
+<li>Server logs are used for operational monitoring and troubleshooting.</li>
+<li>We do not use your data for advertising, profiling, or analytics.</li>
+</ul>
+
+<h2>4. Data Storage and Security</h2>
+<ul>
+<li>OAuth tokens are stored in encrypted form on the server.</li>
+<li>The Service is hosted on Render.com with HTTPS encryption in transit.</li>
+<li>Access to stored tokens is restricted to the authenticated service only.</li>
+</ul>
+
+<h2>5. Data Sharing</h2>
+<p>We do not sell, rent, or share your data with any third parties. Data is transmitted
+only to the social media platforms you have explicitly authorized (TikTok, YouTube,
+Instagram) for the purpose of publishing video content.</p>
+
+<h2>6. Data Retention</h2>
+<ul>
+<li>OAuth tokens are retained until you revoke access or disconnect your account.</li>
+<li>Generated videos are stored temporarily during processing and deleted after upload.</li>
+<li>Server logs are retained for up to 30 days.</li>
+</ul>
+
+<h2>7. Your Rights</h2>
+<p>You have the right to:</p>
+<ul>
+<li><strong>Revoke access:</strong> Disconnect your social media accounts at any time through
+the respective platform's settings or by contacting us.</li>
+<li><strong>Request deletion:</strong> Ask us to delete all stored tokens and data associated
+with your accounts.</li>
+<li><strong>Access your data:</strong> Request a copy of any data we hold about you.</li>
+</ul>
+
+<h2>8. Third-Party Services</h2>
+<p>ClipLoreTV integrates with the following third-party services, each governed by
+their own privacy policies:</p>
+<ul>
+<li><a href="https://www.tiktok.com/legal/privacy-policy" target="_blank">TikTok</a> &mdash; Content Posting API</li>
+<li><a href="https://policies.google.com/privacy" target="_blank">Google/YouTube</a> &mdash; YouTube Data API</li>
+<li><a href="https://www.twitch.tv/p/legal/privacy-notice/" target="_blank">Twitch</a> &mdash; Helix API for clip metadata</li>
+<li><a href="https://privacycenter.instagram.com/policy" target="_blank">Instagram/Meta</a> &mdash; Graph API</li>
+</ul>
+
+<h2>9. Children's Privacy</h2>
+<p>The Service is not directed at individuals under the age of 18. We do not knowingly
+collect data from minors.</p>
+
+<h2>10. Changes to This Policy</h2>
+<p>We may update this Privacy Policy from time to time. Changes will be reflected by
+the "Last updated" date above. Continued use of the Service constitutes acceptance
+of any updates.</p>
+
+<h2>11. Contact Us</h2>
+<p>For privacy-related questions or data requests, contact us at
+<a href="mailto:cliploretv@gmail.com">cliploretv@gmail.com</a>.</p>
+
+<p style="margin-top:2rem"><a href="/">Back to home</a></p>
 </body></html>"""
 
 
