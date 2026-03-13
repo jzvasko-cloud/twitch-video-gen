@@ -900,6 +900,10 @@ def _pick_topic() -> tuple:
 # ===================================================================
 #  Routes — Static / utility
 # ===================================================================
+@app.route("/tiktokabxYnkFg28kcPiB57ORrVrfxpGFZDtL5.txt")
+def tiktok_verify():
+    return "tiktok-developers-site-verification=abxYnkFg28kcPiB57ORrVrfxpGFZDtL5", 200, {"Content-Type": "text/plain"}
+
 @app.route("/")
 def home():
     return """<!DOCTYPE html>
