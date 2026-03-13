@@ -429,8 +429,37 @@ def clean_script(raw: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _get_clip_source_url(slug: str) -> str:
+    """Use Twitch GQL to get an authenticated clip download URL."""
+    resp = requests.post(
+        "https://gql.twitch.tv/gql",
+        headers={"Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko"},
+        json=[{
+            "operationName": "VideoAccessToken_Clip",
+            "variables": {"slug": slug},
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11",
+                }
+            },
+        }],
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()[0].get("data", {}).get("clip", {})
+    if not data:
+        raise ValueError(f"No clip data for slug {slug}")
+    token = data["playbackAccessToken"]
+    qualities = data.get("videoQualities", [])
+    if not qualities:
+        raise ValueError(f"No video qualities for slug {slug}")
+    source_url = qualities[0]["sourceURL"]
+    return f"{source_url}?sig={token['signature']}&token={requests.utils.quote(token['value'])}"
+
+
 def fetch_clip_urls(streamers: list, count: int = 3) -> list:
-    """Fetch Twitch clip download URLs for the given streamers."""
+    """Fetch Twitch clip slugs and resolve to download URLs."""
     token = _get_twitch_token()
     urls = []
     for streamer in streamers:
@@ -444,9 +473,13 @@ def fetch_clip_urls(streamers: list, count: int = 3) -> list:
             )
             resp.raise_for_status()
             for clip in resp.json().get("data", []):
-                thumb = clip.get("thumbnail_url", "")
-                if "-preview-" in thumb:
-                    urls.append(thumb.split("-preview-")[0] + ".mp4")
+                slug = clip.get("id", "")
+                if slug:
+                    try:
+                        url = _get_clip_source_url(slug)
+                        urls.append(url)
+                    except Exception as exc:
+                        log.warning("Failed to resolve clip %s: %s", slug, exc)
         except Exception:
             continue
     return urls
