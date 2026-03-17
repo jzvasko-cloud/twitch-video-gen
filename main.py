@@ -485,6 +485,39 @@ def fetch_clip_urls(streamers: list, count: int = 3) -> list:
     return urls
 
 
+def fetch_pexels_videos(query: str = "gaming", count: int = 3) -> list:
+    """Fetch stock video URLs from Pexels as a fallback when Twitch clips are unavailable."""
+    if not PEXELS_API_KEY:
+        log.warning("PEXELS_API_KEY not set — cannot fetch stock footage")
+        return []
+
+    try:
+        resp = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": PEXELS_API_KEY},
+            params={"query": query, "per_page": count, "orientation": "portrait"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        urls = []
+        for video in resp.json().get("videos", []):
+            # Pick the HD file (or largest available)
+            files = sorted(
+                video.get("video_files", []),
+                key=lambda f: f.get("height", 0),
+                reverse=True,
+            )
+            for f in files:
+                link = f.get("link", "")
+                if link and f.get("height", 0) >= 720:
+                    urls.append(link)
+                    break
+        return urls
+    except Exception as exc:
+        log.warning("Pexels API request failed: %s", exc)
+        return []
+
+
 def assemble_video_from_parts(script_text: str, clip_urls: list) -> tuple:
     """Download clips, generate TTS, assemble 9:16 video. Returns (video_path, duration)."""
     _cleanup_temp()
@@ -520,7 +553,22 @@ def assemble_video_from_parts(script_text: str, clip_urls: list) -> tuple:
             continue
 
     if not clip_paths:
-        raise ValueError("Could not download any clips")
+        # Fallback: try Pexels stock footage
+        log.info("No Twitch clips downloaded — trying Pexels stock footage fallback")
+        pexels_urls = fetch_pexels_videos(query="gaming", count=3)
+        for i, url in enumerate(pexels_urls):
+            cp = job_dir / f"pexels_{i}.mp4"
+            try:
+                r = requests.get(url, timeout=30, stream=True)
+                r.raise_for_status()
+                with open(cp, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+                clip_paths.append(cp)
+            except Exception as exc:
+                log.warning("Pexels download failed for %s: %s", url[:80], exc)
+        if not clip_paths:
+            raise ValueError("Could not download any clips (Twitch and Pexels both failed)")
 
     # Scale each clip to 1080x1920 (9:16)
     scaled = []

@@ -15,7 +15,7 @@ Flask web service that automatically generates TikTok videos from Twitch clips w
 - **gTTS** — text-to-speech for voiceover
 - **FFmpeg** — video processing (scale/crop to 1080x1920 9:16, concat clips, merge audio)
 - **TikTok Content Posting API v2** — OAuth Login Kit with PKCE for publishing
-- **Pexels API** — stock footage fallback (not yet implemented)
+- **Pexels API** — stock footage fallback when Twitch clips are unavailable
 
 ## Environment Variables (set in Render dashboard)
 - `ANTHROPIC_API_KEY` — Claude API
