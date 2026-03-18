@@ -717,9 +717,9 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
 
     # Download clips
-    log.info("Downloading up to %d clips (vo_duration=%.1fs)", min(len(clip_urls), 5), vo_duration)
+    log.info("Downloading up to %d clips (vo_duration=%.1fs)", min(len(clip_urls), 3), vo_duration)
     clip_paths = []
-    for i, url in enumerate(clip_urls[:5]):
+    for i, url in enumerate(clip_urls[:3]):
         cp = job_dir / f"clip_{i}.mp4"
         try:
             r = requests.get(url, timeout=30, stream=True)
@@ -753,24 +753,34 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale each clip to 1080x1920 (9:16)
-    log.info("Scaling %d clips to 1080x1920", len(clip_paths))
+    # Scale each clip to 720x1280 (9:16) — 720p is fast to encode on free tier
+    # Limit to 3 clips max to keep encoding time reasonable
+    use_clips = clip_paths[:3]
+    log.info("Scaling %d clips to 720x1280", len(use_clips))
     scaled = []
-    per_clip = vo_duration / max(len(clip_paths), 1) + 1
-    for i, cp in enumerate(clip_paths):
+    per_clip = vo_duration / max(len(use_clips), 1) + 1
+    for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", str(cp),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-an",
-                "-t", str(per_clip),
-                str(sp),
-            ],
-            capture_output=True, timeout=120,
-        )
-        if sp.exists():
-            scaled.append(sp)
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(cp),
+                    "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
+                    "-t", str(per_clip),
+                    str(sp),
+                ],
+                capture_output=True, timeout=180,
+            )
+            if sp.exists():
+                scaled.append(sp)
+                log.info("Scaled clip %d/%d (%.0fs)", i + 1, len(use_clips), per_clip)
+            else:
+                log.warning("Clip %d scaling produced no output: %s", i, result.stderr[-200:] if result.stderr else "")
+        except subprocess.TimeoutExpired:
+            log.warning("Clip %d scaling timed out after 180s, skipping", i)
+        except Exception as exc:
+            log.warning("Clip %d scaling failed: %s", i, exc)
 
     if not scaled:
         raise ValueError("FFmpeg scaling failed")
@@ -786,15 +796,15 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Merge video + voiceover
+    # Merge video + voiceover (copy video stream, only encode audio)
     log.info("Merging video + voiceover (vo_duration=%.1fs, %d scaled clips)", vo_duration, len(scaled))
     final = job_dir / "final.mp4"
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+         "-c:v", "copy",
          "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
          str(final)],
-        capture_output=True, timeout=300,
+        capture_output=True, timeout=120,
     )
 
     if not final.exists():
