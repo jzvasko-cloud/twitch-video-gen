@@ -1698,6 +1698,11 @@ def pipeline():
 @app.route("/cron", methods=["POST"])
 @require_api_key
 def cron():
+    """Kick off pipeline in background thread and return 202 immediately.
+
+    This lets cron-job.org (30s max timeout) get a fast response while the
+    pipeline runs for ~2 minutes in the background.
+    """
     tiktok_token = _get_tiktok_token()
 
     data = request.get_json(silent=True) or {}
@@ -1707,7 +1712,12 @@ def cron():
     topic, pillar = _pick_topic()
     log.info("CRON: topic=%s pillar=%s streamers=%s", topic[:50], pillar, streamers)
 
-    return _run_pipeline(topic, pillar, streamers, tiktok_token, description)
+    def _bg():
+        with app.app_context():
+            _run_pipeline(topic, pillar, streamers, tiktok_token, description)
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"status": "accepted", "topic": topic, "pillar": pillar}), 202
 
 
 def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
