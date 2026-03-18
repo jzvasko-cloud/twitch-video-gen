@@ -1,5 +1,5 @@
 """
-ClipLoreTV Auto-Post Service
+ClipLoreTV Service
 Flask backend for automated Twitch clip -> TikTok/YouTube/Instagram video pipeline.
 """
 
@@ -966,7 +966,7 @@ a{color:#9147ff}
 <p class="updated">Last updated: March 13, 2026</p>
 
 <h2>1. Acceptance of Terms</h2>
-<p>By accessing or using ClipLoreTV Auto-Post ("ClipLoreTV", "the Service"), you agree to be bound by these Terms
+<p>By accessing or using ClipLoreTV ("ClipLoreTV", "the Service"), you agree to be bound by these Terms
 of Service. If you do not agree, do not use the Service.</p>
 
 <h2>2. Description of Service</h2>
@@ -1040,7 +1040,7 @@ a{color:#9147ff}
 <p class="updated">Last updated: March 13, 2026</p>
 
 <h2>1. Introduction</h2>
-<p>ClipLoreTV Auto-Post ("ClipLoreTV", "we", "our", "the Service") respects your privacy. This Privacy Policy
+<p>ClipLoreTV ("ClipLoreTV", "we", "our", "the Service") respects your privacy. This Privacy Policy
 explains what data we collect, how we use it, and your rights regarding that data.</p>
 
 <h2>2. Data We Collect</h2>
