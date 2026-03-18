@@ -1885,8 +1885,15 @@ def cron():
     log.info("CRON: topic=%s pillar=%s streamers=%s", topic[:50], pillar, streamers)
 
     def _bg():
-        with app.app_context():
-            _run_pipeline(topic, pillar, streamers, tiktok_token, description)
+        try:
+            with app.app_context():
+                _run_pipeline(topic, pillar, streamers, tiktok_token, description)
+        except Exception as exc:
+            log.error("Background pipeline crashed: %s", exc, exc_info=True)
+            _send_notification("💥 Pipeline Crashed", str(exc)[:500], success=False,
+                               details={"topic": topic, "pillar": pillar})
+            _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _last_pipeline_result["result"] = {"error": str(exc), "topic": topic}
 
     threading.Thread(target=_bg, daemon=True).start()
     return jsonify({"status": "accepted", "topic": topic, "pillar": pillar}), 202
