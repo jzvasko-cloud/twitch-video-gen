@@ -58,6 +58,8 @@ META_REDIRECT_URI = f"{SELF_URL}/instagram/callback"
 API_SECRET = os.environ.get("CLIPLORE_API_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-d6ich8haae7s73ce1i70")
 
 # Fail fast: require API secret in production to prevent open endpoints
 if not API_SECRET and os.environ.get("RENDER"):
@@ -83,7 +85,11 @@ VALID_PILLARS = set(PILLAR_PREFIXES.keys()) | {""}
 DEFAULT_STREAMERS = ["xqc", "pokimane", "asmongold", "hasanabi", "shroud", "nickmercs", "timthetatman"]
 
 # ---------------------------------------------------------------------------
-# Encrypted token storage (shared by TikTok, YouTube, Instagram)
+# Encrypted token storage — persisted to Render env vars via API
+# ---------------------------------------------------------------------------
+# Tokens are stored as a single encrypted JSON blob in the PLATFORM_TOKENS_ENC
+# env var. On token change, the app pushes the update to Render's API so it
+# survives redeploys and spin-downs. Falls back to local file for dev.
 # ---------------------------------------------------------------------------
 _token_key_material = (API_SECRET or "local-dev-key-not-secure").encode()
 _token_fernet_key = base64.urlsafe_b64encode(
@@ -93,46 +99,106 @@ _token_cipher = Fernet(_token_fernet_key)
 
 _TOKEN_DEFAULTS = {"access_token": None, "refresh_token": None, "expires_at": 0}
 
+# All platform tokens in one dict: {"tiktok": {...}, "youtube": {...}, "instagram": {...}}
+_all_tokens: dict = {}
 
-def _load_platform_tokens(filename: str, extra_defaults: dict | None = None) -> dict:
-    default = {**_TOKEN_DEFAULTS, **(extra_defaults or {})}
-    fpath = TEMP_DIR / filename
+
+def _load_all_tokens():
+    """Load all platform tokens from env var, falling back to legacy files."""
+    global _all_tokens
+    loaded = False
+
+    # Try env var first (Render-persisted)
+    enc = os.environ.get("PLATFORM_TOKENS_ENC", "")
+    if enc:
+        try:
+            decrypted = _token_cipher.decrypt(enc.encode())
+            _all_tokens = json.loads(decrypted)
+            loaded = True
+            log.info("Loaded tokens from PLATFORM_TOKENS_ENC env var (%d platforms)", len(_all_tokens))
+        except Exception as e:
+            log.warning("Failed to decrypt PLATFORM_TOKENS_ENC: %s", type(e).__name__)
+
+    # Fall back to legacy files (migration path)
+    if not loaded:
+        for platform, filename, extras in [
+            ("tiktok", "tiktok_tokens.enc", {"open_id": None}),
+            ("youtube", "youtube_tokens.enc", None),
+            ("instagram", "instagram_tokens.enc", None),
+        ]:
+            fpath = TEMP_DIR / filename
+            try:
+                if fpath.exists():
+                    decrypted = _token_cipher.decrypt(fpath.read_bytes())
+                    _all_tokens[platform] = json.loads(decrypted)
+                    log.info("Migrated %s tokens from legacy file", platform)
+            except Exception:
+                pass
+
+    # Ensure all platforms exist with defaults
+    for platform, extras in [("tiktok", {"open_id": None}), ("youtube", None), ("instagram", None)]:
+        default = {**_TOKEN_DEFAULTS, **(extras or {})}
+        if platform not in _all_tokens:
+            _all_tokens[platform] = default
+        else:
+            for k, v in default.items():
+                _all_tokens[platform].setdefault(k, v)
+
+
+def _persist_tokens():
+    """Push all tokens to Render env var via API. Also save to local file as cache."""
+    encrypted = _token_cipher.encrypt(json.dumps(_all_tokens).encode()).decode()
+
+    # Save locally for the running process
     try:
-        if fpath.exists():
-            decrypted = _token_cipher.decrypt(fpath.read_bytes())
-            default.update(json.loads(decrypted))
-    except (InvalidToken, Exception) as e:
-        log.warning("Failed to load %s (may need re-auth): %s", filename, type(e).__name__)
-        fpath.unlink(missing_ok=True)
-    return default
-
-
-def _save_platform_tokens(filename: str, store: dict):
-    fpath = TEMP_DIR / filename
-    try:
-        fpath.write_bytes(_token_cipher.encrypt(json.dumps(store).encode()))
+        fpath = TEMP_DIR / "platform_tokens.enc"
+        fpath.write_bytes(encrypted.encode())
         fpath.chmod(0o600)
-    except Exception as e:
-        log.warning("Failed to save %s: %s", filename, e)
+    except Exception:
+        pass
+
+    # Push to Render API (survives redeploys)
+    if RENDER_API_KEY and RENDER_SERVICE_ID:
+        try:
+            resp = requests.put(
+                f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars/PLATFORM_TOKENS_ENC",
+                headers={
+                    "Authorization": f"Bearer {RENDER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"value": encrypted},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                log.info("Tokens persisted to Render env var")
+            else:
+                log.warning("Render API env var update failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.warning("Failed to persist tokens to Render API: %s", e)
+    else:
+        log.debug("RENDER_API_KEY not set — tokens saved locally only")
 
 
-# TikTok tokens
-_tiktok_token_store = _load_platform_tokens("tiktok_tokens.enc", {"open_id": None})
+# Initialize on startup
+_load_all_tokens()
+
+# Convenience accessors (keep existing interface)
+_tiktok_token_store = _all_tokens["tiktok"]
+_youtube_token_store = _all_tokens["youtube"]
+_instagram_token_store = _all_tokens["instagram"]
+
 
 def _save_tiktok_tokens():
-    _save_platform_tokens("tiktok_tokens.enc", _tiktok_token_store)
-
-# YouTube tokens
-_youtube_token_store = _load_platform_tokens("youtube_tokens.enc")
+    _all_tokens["tiktok"] = _tiktok_token_store
+    _persist_tokens()
 
 def _save_youtube_tokens():
-    _save_platform_tokens("youtube_tokens.enc", _youtube_token_store)
-
-# Instagram tokens
-_instagram_token_store = _load_platform_tokens("instagram_tokens.enc")
+    _all_tokens["youtube"] = _youtube_token_store
+    _persist_tokens()
 
 def _save_instagram_tokens():
-    _save_platform_tokens("instagram_tokens.enc", _instagram_token_store)
+    _all_tokens["instagram"] = _instagram_token_store
+    _persist_tokens()
 
 # Server-side OAuth state store (cookies are unreliable across redirects)
 _OAUTH_STATE_FILE = TEMP_DIR / "oauth_states.json"
