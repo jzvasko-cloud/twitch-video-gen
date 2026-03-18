@@ -717,6 +717,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
 
     # Download clips
+    log.info("Downloading up to %d clips (vo_duration=%.1fs)", min(len(clip_urls), 5), vo_duration)
     clip_paths = []
     for i, url in enumerate(clip_urls[:5]):
         cp = job_dir / f"clip_{i}.mp4"
@@ -753,6 +754,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
     # Scale each clip to 1080x1920 (9:16)
+    log.info("Scaling %d clips to 1080x1920", len(clip_paths))
     scaled = []
     per_clip = vo_duration / max(len(clip_paths), 1) + 1
     for i, cp in enumerate(clip_paths):
@@ -784,39 +786,16 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Generate subtitle file for caption overlay
-    srt_path = job_dir / "captions.srt"
-    _generate_srt(script_text, vo_duration, srt_path)
-
-    # Merge video + voiceover + burned-in captions
+    # Merge video + voiceover
+    log.info("Merging video + voiceover (vo_duration=%.1fs, %d scaled clips)", vo_duration, len(scaled))
     final = job_dir / "final.mp4"
-    # Escape path for FFmpeg subtitles filter (Windows backslashes and colons)
-    srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
-    subtitle_filter = (
-        f"subtitles='{srt_escaped}':force_style='"
-        "FontName=Arial,FontSize=22,Bold=1,"
-        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-        "Outline=2,Shadow=1,Alignment=10,MarginV=80'"
-    )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
-         "-vf", subtitle_filter,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
          str(final)],
-        capture_output=True, timeout=180,
+        capture_output=True, timeout=300,
     )
-
-    # Fallback: if subtitle burn fails, merge without captions
-    if not final.exists():
-        log.warning("Subtitle burn failed, merging without captions")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-             str(final)],
-            capture_output=True, timeout=120,
-        )
 
     if not final.exists():
         raise ValueError("Final video assembly failed")
