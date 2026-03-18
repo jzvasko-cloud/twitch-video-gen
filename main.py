@@ -472,32 +472,37 @@ Return ONLY the script text. Include [VISUAL] tags inline. Include [PAUSE] tags 
 #  Core logic — reusable functions (no Flask request dependency)
 # ===================================================================
 
-def generate_script_text(topic: str, pillar: str = "") -> str:
-    """Call Gemini (free) or Claude to generate a TikTok commentary script."""
-    user_msg = PILLAR_PREFIXES.get(pillar, "") + topic
+MIN_SCRIPT_WORDS = 100
+MAX_SCRIPT_RETRIES = 3
 
-    if GEMINI_API_KEY:
-        try:
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-                headers={"content-type": "application/json"},
-                json={
-                    "system_instruction": {"parts": [{"text": CLIPLORE_SYSTEM_PROMPT}]},
-                    "contents": [{"parts": [{"text": user_msg}]}],
-                    "generationConfig": {"maxOutputTokens": 1024},
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            log.warning("Gemini API error %s: %s — falling back to Claude", resp.status_code, resp.text[:300])
-        except Exception as exc:
-            log.warning("Gemini request failed (%s) — falling back to Claude", exc)
 
-    # Fallback to Anthropic Claude
-    gemini_err = "Gemini failed or not configured"
+def _call_gemini(user_msg: str) -> str | None:
+    """Call Gemini API. Returns script text or None on failure."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+            headers={"content-type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": CLIPLORE_SYSTEM_PROMPT}]},
+                "contents": [{"parts": [{"text": user_msg}]}],
+                "generationConfig": {"maxOutputTokens": 1024},
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        log.warning("Gemini API error %s: %s", resp.status_code, resp.text[:300])
+    except Exception as exc:
+        log.warning("Gemini request failed: %s", exc)
+    return None
+
+
+def _call_claude(user_msg: str) -> str | None:
+    """Call Anthropic Claude API. Returns script text or None on failure."""
     if not ANTHROPIC_API_KEY:
-        raise RuntimeError(f"All AI backends failed — Gemini: {gemini_err}, Claude: no API key set")
+        return None
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -516,13 +521,46 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
         )
         if resp.status_code == 200:
             return resp.json()["content"][0]["text"]
-        claude_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
-        log.warning("Anthropic API error: %s", claude_err)
+        log.warning("Anthropic API error %s: %s", resp.status_code, resp.text[:200])
     except Exception as exc:
-        claude_err = str(exc)
-        log.warning("Anthropic request failed: %s", claude_err)
+        log.warning("Anthropic request failed: %s", exc)
+    return None
 
-    raise RuntimeError(f"All AI backends failed — Gemini: {gemini_err}, Claude: {claude_err}")
+
+def generate_script_text(topic: str, pillar: str = "") -> str:
+    """Generate a TikTok script, retrying if too short (< 100 words)."""
+    base_msg = PILLAR_PREFIXES.get(pillar, "") + topic
+
+    for attempt in range(MAX_SCRIPT_RETRIES):
+        # Add length enforcement on retries
+        if attempt == 0:
+            user_msg = base_msg
+        else:
+            user_msg = (
+                base_msg
+                + f"\n\nIMPORTANT: Your previous script was only {word_count} words. "
+                "That is WAY too short. You MUST write at least 120 words. "
+                "Include a full [HOOK], [BUILD] with 3-4 beats, [PAYOFF], and [CTA]. "
+                "Make it 40-60 seconds when read aloud."
+            )
+
+        # Try Gemini first, then Claude
+        script = _call_gemini(user_msg) or _call_claude(user_msg)
+
+        if not script:
+            raise RuntimeError("All AI backends failed — neither Gemini nor Claude returned a script")
+
+        word_count = len(clean_script(script).split())
+        log.info("Script attempt %d: %d words (min %d)", attempt + 1, word_count, MIN_SCRIPT_WORDS)
+
+        if word_count >= MIN_SCRIPT_WORDS:
+            return script
+
+        log.warning("Script too short (%d words), retrying...", word_count)
+
+    # Return the last script even if short, better than nothing
+    log.warning("Script still short after %d retries (%d words), using anyway", MAX_SCRIPT_RETRIES, word_count)
+    return script
 
 
 def clean_script(raw: str) -> str:
@@ -615,8 +653,40 @@ def _fetch_pexels_clips(query: str = "gaming esports", count: int = 3) -> list:
         return []
 
 
+def _generate_srt(script_text: str, duration: float, srt_path: Path):
+    """Generate an SRT subtitle file with ~3-word chunks timed across the duration."""
+    cleaned = clean_script(script_text)
+    words = cleaned.split()
+    if not words:
+        return
+
+    # Group into chunks of 3-4 words for punchy captions
+    chunk_size = 3
+    chunks = []
+    for i in range(0, len(words), chunk_size):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+
+    time_per_chunk = duration / len(chunks)
+    lines = []
+    for i, chunk in enumerate(chunks):
+        start = i * time_per_chunk
+        end = min((i + 1) * time_per_chunk, duration)
+        # SRT time format: HH:MM:SS,mmm
+        s_h, s_m = int(start // 3600), int((start % 3600) // 60)
+        s_s, s_ms = int(start % 60), int((start % 1) * 1000)
+        e_h, e_m = int(end // 3600), int((end % 3600) // 60)
+        e_s, e_ms = int(end % 60), int((end % 1) * 1000)
+        lines.append(f"{i + 1}")
+        lines.append(f"{s_h:02d}:{s_m:02d}:{s_s:02d},{s_ms:03d} --> {e_h:02d}:{e_m:02d}:{e_s:02d},{e_ms:03d}")
+        lines.append(chunk.upper())
+        lines.append("")
+
+    srt_path.write_text("\n".join(lines), encoding="utf-8")
+    log.info("Generated SRT with %d subtitle chunks for %.1fs video", len(chunks), duration)
+
+
 def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "") -> tuple:
-    """Download clips, generate TTS, assemble 9:16 video. Returns (video_path, duration)."""
+    """Download clips, generate TTS, assemble 9:16 video with captions. Returns (video_path, duration)."""
     _cleanup_temp()
 
     job_id = uuid.uuid4().hex[:10]
@@ -702,15 +772,39 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Merge video + voiceover
+    # Generate subtitle file for caption overlay
+    srt_path = job_dir / "captions.srt"
+    _generate_srt(script_text, vo_duration, srt_path)
+
+    # Merge video + voiceover + burned-in captions
     final = job_dir / "final.mp4"
+    # Escape path for FFmpeg subtitles filter (Windows backslashes and colons)
+    srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
+    subtitle_filter = (
+        f"subtitles='{srt_escaped}':force_style='"
+        "FontName=Arial,FontSize=22,Bold=1,"
+        "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        "Outline=2,Shadow=1,Alignment=10,MarginV=80'"
+    )
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
+         "-vf", subtitle_filter,
          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
          "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
          str(final)],
-        capture_output=True, timeout=120,
+        capture_output=True, timeout=180,
     )
+
+    # Fallback: if subtitle burn fails, merge without captions
+    if not final.exists():
+        log.warning("Subtitle burn failed, merging without captions")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+             str(final)],
+            capture_output=True, timeout=120,
+        )
 
     if not final.exists():
         raise ValueError("Final video assembly failed")
