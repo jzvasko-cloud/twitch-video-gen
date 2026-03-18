@@ -456,7 +456,7 @@ SCRIPT STRUCTURE (strict — follow every time):
   - "Am I wrong? Prove it below."
 
 VOICE RULES:
-- Total length: 120-180 words (40-60 second TikTok)
+- CRITICAL: Total spoken words MUST be between 120-180 words. Count them. This is NOT optional. Scripts under 100 spoken words will be rejected and you will have to redo them.
 - Tone: confident, slightly cocky, like a friend who watches too much Twitch
 - No "Hey guys," no "Welcome back," no intro fluff — open cold
 - Short sentences. Punchy. Never more than 15 words per sentence.
@@ -465,7 +465,7 @@ VOICE RULES:
 - Reference specific moments, usernames, or events — never be vague
 
 OUTPUT FORMAT:
-Return ONLY the script text. Include [VISUAL] tags inline. Include [PAUSE] tags where dramatic pauses should go. No headers, no notes, no meta-commentary."""
+Return ONLY the narration script text that will be read aloud. Do NOT include [VISUAL] tags, [HOOK] tags, [BUILD] tags, [PAYOFF] tags, [CTA] tags, or any markdown formatting. Just write the pure spoken words, 120-180 words total, as one continuous script. No headers, no notes, no meta-commentary, no tags of any kind."""
 
 
 # ===================================================================
@@ -487,12 +487,19 @@ def _call_gemini(user_msg: str) -> str | None:
             json={
                 "system_instruction": {"parts": [{"text": CLIPLORE_SYSTEM_PROMPT}]},
                 "contents": [{"parts": [{"text": user_msg}]}],
-                "generationConfig": {"maxOutputTokens": 1024},
+                "generationConfig": {
+                    "maxOutputTokens": 2048,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
             },
-            timeout=30,
+            timeout=45,
         )
         if resp.status_code == 200:
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            # Gemini 2.5 may return multiple parts (thinking + text); get the last text part
+            parts = resp.json()["candidates"][0]["content"]["parts"]
+            for part in reversed(parts):
+                if "text" in part:
+                    return part["text"]
         log.warning("Gemini API error %s: %s", resp.status_code, resp.text[:300])
     except Exception as exc:
         log.warning("Gemini request failed: %s", exc)
@@ -564,11 +571,16 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
 
 
 def clean_script(raw: str) -> str:
-    """Strip [VISUAL], [PAUSE], [HOOK], etc. tags from a script."""
-    text = re.sub(r"\[VISUAL:[^\]]*\]", "", raw)
-    text = re.sub(r"\[PAUSE[^\]]*\]", "", text)
-    text = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    """Strip [VISUAL], [PAUSE], [HOOK], etc. tags and markdown from a script."""
+    text = re.sub(r"\[VISUAL[^\]]*\]", "", raw)   # [VISUAL: ...] and [VISUAL]
+    text = re.sub(r"\[PAUSE[^\]]*\]", "", text)    # [PAUSE 0.5s] etc.
+    text = re.sub(r"\[(HOOK|BUILD|PAYOFF|CTA)\]", "", text)  # section markers
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)  # **bold** -> bold
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)      # *italic* -> italic
+    text = re.sub(r"^#+\s+", "", text, flags=re.MULTILINE)  # # headers
+    text = re.sub(r"^[-*]\s+", "", text, flags=re.MULTILINE)  # bullet points
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _get_clip_source_url(slug: str) -> str:
