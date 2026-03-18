@@ -57,6 +57,7 @@ INSTAGRAM_ACCOUNT_ID = os.environ.get("INSTAGRAM_BUSINESS_ACCOUNT_ID", "")
 META_REDIRECT_URI = f"{SELF_URL}/instagram/callback"
 API_SECRET = os.environ.get("CLIPLORE_API_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 # Fail fast: require API secret in production to prevent open endpoints
 if not API_SECRET and os.environ.get("RENDER"):
@@ -274,6 +275,36 @@ def require_api_key(f):
 
 
 # ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+_last_pipeline_result = {"timestamp": None, "result": None}
+
+
+def _send_notification(title: str, message: str, success: bool = True, details: dict | None = None):
+    """Send a Discord webhook notification. Silently no-ops if not configured."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        color = 0x00FF00 if success else 0xFF0000
+        fields = []
+        if details:
+            for k, v in details.items():
+                fields.append({"name": k, "value": str(v)[:200], "inline": True})
+        payload = {
+            "embeds": [{
+                "title": title,
+                "description": message[:2000],
+                "color": color,
+                "fields": fields[:25],
+                "footer": {"text": "ClipLoreTV Pipeline"},
+            }]
+        }
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as exc:
+        log.warning("Discord notification failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Request hooks
 # ---------------------------------------------------------------------------
 @app.before_request
@@ -398,27 +429,34 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
             log.warning("Gemini request failed (%s) — falling back to Claude", exc)
 
     # Fallback to Anthropic Claude
+    gemini_err = "Gemini failed or not configured"
     if not ANTHROPIC_API_KEY:
-        raise RuntimeError("No working AI backend: Gemini failed and ANTHROPIC_API_KEY is not set")
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-5-20250929",
-            "max_tokens": 1024,
-            "system": CLIPLORE_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_msg}],
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        log.error("Anthropic API error %s: %s", resp.status_code, resp.text[:500])
-    resp.raise_for_status()
-    return resp.json()["content"][0]["text"]
+        raise RuntimeError(f"All AI backends failed — Gemini: {gemini_err}, Claude: no API key set")
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-5-20250929",
+                "max_tokens": 1024,
+                "system": CLIPLORE_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_msg}],
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()["content"][0]["text"]
+        claude_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        log.warning("Anthropic API error: %s", claude_err)
+    except Exception as exc:
+        claude_err = str(exc)
+        log.warning("Anthropic request failed: %s", claude_err)
+
+    raise RuntimeError(f"All AI backends failed — Gemini: {gemini_err}, Claude: {claude_err}")
 
 
 def clean_script(raw: str) -> str:
@@ -485,7 +523,33 @@ def fetch_clip_urls(streamers: list, count: int = 3) -> list:
     return urls
 
 
-def assemble_video_from_parts(script_text: str, clip_urls: list) -> tuple:
+def _fetch_pexels_clips(query: str = "gaming esports", count: int = 3) -> list:
+    """Search Pexels for portrait videos as fallback footage. Returns download URLs."""
+    if not PEXELS_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": PEXELS_API_KEY},
+            params={"query": query, "per_page": count, "orientation": "portrait"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        urls = []
+        for video in resp.json().get("videos", []):
+            files = video.get("video_files", [])
+            # prefer HD portrait files
+            best = sorted(files, key=lambda f: f.get("height", 0), reverse=True)
+            if best:
+                urls.append(best[0]["link"])
+        log.info("Pexels returned %d fallback clips for query '%s'", len(urls), query)
+        return urls
+    except Exception as exc:
+        log.warning("Pexels API failed: %s", exc)
+        return []
+
+
+def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "") -> tuple:
     """Download clips, generate TTS, assemble 9:16 video. Returns (video_path, duration)."""
     _cleanup_temp()
 
@@ -519,8 +583,26 @@ def assemble_video_from_parts(script_text: str, clip_urls: list) -> tuple:
             log.warning("Clip download failed for %s: %s", url[:80], exc)
             continue
 
+    # Pexels fallback if all Twitch clips failed
+    if not clip_paths and PEXELS_API_KEY:
+        log.warning("All Twitch clips failed — trying Pexels fallback")
+        pexels_query = topic if topic else "gaming esports"
+        pexels_urls = _fetch_pexels_clips(pexels_query, count=3)
+        for i, url in enumerate(pexels_urls):
+            cp = job_dir / f"pexels_{i}.mp4"
+            try:
+                r = requests.get(url, timeout=30, stream=True)
+                r.raise_for_status()
+                with open(cp, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+                clip_paths.append(cp)
+            except Exception as exc:
+                log.warning("Pexels clip download failed: %s", exc)
+                continue
+
     if not clip_paths:
-        raise ValueError("Could not download any clips")
+        raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
     # Scale each clip to 1080x1920 (9:16)
     scaled = []
@@ -1637,24 +1719,31 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
         script_text = generate_script_text(topic, pillar)
         results["steps"]["script"] = {"status": "ok", "word_count": len(script_text.split())}
     except Exception as e:
-        return jsonify({"error": f"Script generation failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
+        err = f"Script generation failed: {_sanitize(str(e))}"
+        _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
+        return jsonify({"error": err, "steps": results["steps"]}), 500
 
     # Step 2: Fetch clips
     try:
         clip_urls = fetch_clip_urls(streamers)
         results["steps"]["clips"] = {"status": "ok", "count": len(clip_urls)}
     except Exception as e:
-        return jsonify({"error": f"Clip fetch failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
+        err = f"Clip fetch failed: {_sanitize(str(e))}"
+        _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
+        return jsonify({"error": err, "steps": results["steps"]}), 500
 
     if not clip_urls:
+        _send_notification("❌ Pipeline Failed", "No clips found", success=False, details={"topic": topic})
         return jsonify({"error": "No clips found", "steps": results["steps"]}), 400
 
     # Step 3: Assemble video
     try:
-        video_path, duration = assemble_video_from_parts(script_text, clip_urls)
+        video_path, duration = assemble_video_from_parts(script_text, clip_urls, topic=topic)
         results["steps"]["video"] = {"status": "ok", "duration": duration}
     except Exception as e:
-        return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}", "steps": results["steps"]}), 500
+        err = f"Assembly failed: {_sanitize(str(e))}"
+        _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
+        return jsonify({"error": err, "steps": results["steps"]}), 500
 
     # Step 4: Post to platforms (each independent — one failure doesn't block others)
     all_ok = True
@@ -1706,7 +1795,26 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
 
     platforms = {k: v.get("status") for k, v in results["steps"].items() if k in ("tiktok", "youtube", "instagram")}
     log.info("Pipeline done: topic=%s platforms=%s", topic[:50], platforms)
+
+    # Store last result for /status endpoint
+    _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _last_pipeline_result["result"] = results
+
+    # Send notification
+    if all_ok:
+        _send_notification("✅ Pipeline Complete", topic[:200], success=True, details=platforms)
+    else:
+        _send_notification("⚠️ Pipeline Partial Failure", topic[:200], success=False, details=platforms)
+
     return jsonify(results)
+
+
+@app.route("/status")
+def pipeline_status():
+    """Return the result of the last pipeline run."""
+    if not _last_pipeline_result["timestamp"]:
+        return jsonify({"status": "no runs yet"})
+    return jsonify(_last_pipeline_result)
 
 
 # ---------------------------------------------------------------------------
