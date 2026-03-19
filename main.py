@@ -1036,7 +1036,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         sp = job_dir / f"scaled_{i}.mp4"
         try:
             # Base filter: scale + crop to 9:16 (center-horizontal, top-vertical)
-            vf = "split[bg][fg];[bg]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=25:5,setsar=1[bbg];[fg]scale=720:-2[sfg];[bbg][sfg]overlay=(W-w)/2:(H-h)/3,setsar=1"
+            vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
 
             # First clip only: add hook text in upper-third for 4 seconds
             if i == 0:
@@ -1066,7 +1066,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 if i == 0:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", str(cp),
-                         "-vf", "split[bg][fg];[bg]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=25:5,setsar=1[bbg];[fg]scale=720:-2[sfg];[bbg][sfg]overlay=(W-w)/2:(H-h)/3,setsar=1",
+                         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
                          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                          "-t", str(per_clip), str(sp)],
                         capture_output=True, timeout=180,
