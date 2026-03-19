@@ -1520,6 +1520,17 @@ def health():
     return "ok", 200
 
 
+@app.route("/preview")
+@_require_api_key
+def preview_video():
+    """Serve the last generated video for preview (no upload needed)."""
+    result = _last_pipeline_result.get("result", {})
+    vpath = result.get("video_path", "")
+    if vpath and Path(vpath).exists():
+        return send_file(vpath, mimetype="video/mp4")
+    return "No video available. Run /cron with test_only=true first.", 404
+
+
 @app.route("/tos")
 def tos():
     return """<!DOCTYPE html>
@@ -2199,14 +2210,15 @@ def cron():
     data = request.get_json(silent=True) or {}
     streamers = data.get("streamers", random.sample(DEFAULT_STREAMERS, min(4, len(DEFAULT_STREAMERS))))
     description = data.get("description", "#twitch #gaming #streamer #cliploretv #shorts")
+    test_only = data.get("test_only", False)
 
     topic, pillar = _pick_topic()
-    log.info("CRON: topic=%s pillar=%s streamers=%s", topic[:50], pillar, streamers)
+    log.info("CRON: topic=%s pillar=%s streamers=%s test_only=%s", topic[:50], pillar, streamers, test_only)
 
     def _bg():
         try:
             with app.app_context():
-                _run_pipeline(topic, pillar, streamers, tiktok_token, description)
+                _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_upload=test_only)
         except Exception as exc:
             log.error("Background pipeline crashed: %s", exc, exc_info=True)
             _send_notification("💥 Pipeline Crashed", str(exc)[:500], success=False,
@@ -2218,7 +2230,7 @@ def cron():
     return jsonify({"status": "accepted", "topic": topic, "pillar": pillar}), 202
 
 
-def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
+def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_upload=False):
     """Shared pipeline logic for /pipeline and /cron."""
     results = {"topic": topic, "pillar": pillar, "streamers": streamers, "steps": {}}
 
@@ -2287,6 +2299,15 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
     # Step 4: Post to platforms (each independent — one failure doesn't block others)
     all_ok = True
     short_title = topic[:100] if topic else "ClipLoreTV"
+
+    if skip_upload:
+        results["steps"]["tiktok"] = {"status": "skipped", "reason": "test_only mode"}
+        results["steps"]["youtube"] = {"status": "skipped", "reason": "test_only mode"}
+        results["steps"]["instagram"] = {"status": "skipped", "reason": "test_only mode"}
+        results["video_path"] = str(video_path)
+        log.info("TEST MODE — skipping uploads, video at %s", video_path)
+        _send_notification("🧪 Test Pipeline Complete", f"Video ready (no upload)\n{topic[:60]}", success=True, details=results)
+        return jsonify(results), 200
 
     # 4a: TikTok
     if tiktok_token:
