@@ -824,26 +824,19 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale each clip to 720x1280 (9:16) with Ken Burns zoom effect
-    # Limit to 3 clips max to keep encoding time reasonable
+    # Scale each clip to 720x1280 (9:16)
+    # Limit to 3 clips max to keep encoding time reasonable on free tier
     use_clips = clip_paths[:3]
-    log.info("Scaling %d clips to 720x1280 with zoom", len(use_clips))
+    log.info("Scaling %d clips to 720x1280", len(use_clips))
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 1
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
-            # Scale + crop to 9:16, then apply slow Ken Burns zoom (5% over clip duration)
-            vf = (
-                "scale=760:1350:force_original_aspect_ratio=increase,"
-                "crop=760:1350,setsar=1,"
-                "zoompan=z='min(zoom+0.0003,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-                ":d=1:s=720x1280:fps=30"
-            )
             result = subprocess.run(
                 [
                     "ffmpeg", "-y", "-i", str(cp),
-                    "-vf", vf,
+                    "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                     "-t", str(per_clip),
                     str(sp),
@@ -854,18 +847,8 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 scaled.append(sp)
                 log.info("Scaled clip %d/%d (%.0fs)", i + 1, len(use_clips), per_clip)
             else:
-                # Fallback without zoom if zoompan fails
-                log.warning("Zoom failed for clip %d, trying without zoom", i)
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(cp),
-                     "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
-                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
-                     "-t", str(per_clip), str(sp)],
-                    capture_output=True, timeout=180,
-                )
-                if sp.exists():
-                    scaled.append(sp)
-                    log.info("Scaled clip %d/%d without zoom (%.0fs)", i + 1, len(use_clips), per_clip)
+                log.warning("Clip %d scaling produced no output: %s", i,
+                            result.stderr[-200:] if result.stderr else "")
         except subprocess.TimeoutExpired:
             log.warning("Clip %d scaling timed out after 180s, skipping", i)
         except Exception as exc:
