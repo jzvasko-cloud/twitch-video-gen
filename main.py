@@ -968,9 +968,10 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     vo_duration = float(json.loads(probe.stdout)["format"]["duration"])
 
     # Download clips
-    log.info("Downloading up to %d clips (vo_duration=%.1fs)", min(len(clip_urls), 3), vo_duration)
+    max_download = min(len(clip_urls), 9)
+    log.info("Downloading up to %d clips (vo_duration=%.1fs)", max_download, vo_duration)
     clip_paths = []
-    for i, url in enumerate(clip_urls[:3]):
+    for i, url in enumerate(clip_urls[:max_download]):
         cp = job_dir / f"clip_{i}.mp4"
         try:
             r = requests.get(url, timeout=30, stream=True)
@@ -2310,6 +2311,8 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
         results["steps"]["instagram"] = {"status": "skipped", "reason": "test_only mode"}
         results["video_path"] = str(video_path)
         log.info("TEST MODE — skipping uploads, video at %s", video_path)
+        _last_pipeline_result["result"] = results
+        _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _send_notification("🧪 Test Pipeline Complete", f"Video ready (no upload)\n{topic[:60]}", success=True, details=results)
         return jsonify(results), 200
 
