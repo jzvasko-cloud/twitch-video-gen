@@ -444,7 +444,7 @@ CLIPLORE_SYSTEM_PROMPT = """You are a short-form video scriptwriter for ClipLore
 
 SCRIPT STRUCTURE (strict — follow every time):
 
-[HOOK] — First 3 seconds. The single most controversial, shocking, or curiosity-gap statement in the entire script. This line determines whether 90% of viewers stay or leave. Must create an immediate urge to keep watching OR to comment in disagreement.
+[HOOK] — First 3-4 seconds. A provocative question OR a shocking one-liner that immediately tells the viewer WHAT this video is about and WHY they should care. The viewer just scrolled to this with ZERO context. The hook MUST work as a standalone sentence that establishes the topic. It MUST contain at least one specific name, event, or claim. Examples: "Did HasanAbi actually destroy Destiny, or did everyone just miss the point?" / "xQc just proved why Twitch will never beat YouTube." NEVER start with a generic line like "Let me tell you something" or "This is going to shock you" — those could apply to any video and get swiped instantly.
 
 [VISUAL: describe what clip footage should show during this section]
 
@@ -621,6 +621,93 @@ def _get_clip_source_url(slug: str) -> str:
     return f"{source_url}?sig={token['signature']}&token={requests.utils.quote(token['value'])}"
 
 
+def _extract_clip_sources(topic: str) -> dict:
+    """Ask AI to extract relevant streamer names and game names from a topic.
+
+    Returns {"streamers": [...], "games": [...]} or empty dict on failure.
+    """
+    prompt = (
+        f"Given this video topic about Twitch/gaming: \"{topic}\"\n\n"
+        "Return a JSON object with:\n"
+        '- "streamers": list of 2-4 Twitch login usernames (lowercase, no spaces) '
+        "that are directly mentioned or most relevant to this topic\n"
+        '- "games": list of 1-2 exact Twitch game/category names relevant to the clips '
+        "that would look good as background footage\n\n"
+        "Examples:\n"
+        '- "xQc vs Hasan debate" → {"streamers": ["xqc", "hasanabi"], "games": ["Just Chatting"]}\n'
+        '- "Fortnite is dying" → {"streamers": ["ninja", "tfue", "clix"], "games": ["Fortnite"]}\n'
+        '- "Top Valorant plays" → {"streamers": ["tarik", "tenz"], "games": ["VALORANT"]}\n\n'
+        "Return ONLY valid JSON, nothing else."
+    )
+    try:
+        raw = _call_gemini(prompt) or _call_claude(prompt) or ""
+        # Extract JSON from response (may have markdown fencing)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw)
+        streamers = [s.lower().strip() for s in data.get("streamers", []) if isinstance(s, str)]
+        games = [g.strip() for g in data.get("games", []) if isinstance(g, str)]
+        log.info("AI extracted sources — streamers: %s, games: %s", streamers, games)
+        return {"streamers": streamers[:4], "games": games[:2]}
+    except Exception as exc:
+        log.warning("Failed to extract clip sources from topic: %s", exc)
+        # Fallback: try to find streamer names mentioned in the topic
+        topic_lower = topic.lower()
+        found = [s for s in DEFAULT_STREAMERS if s.lower() in topic_lower]
+        if found:
+            log.info("Keyword fallback found streamers: %s", found)
+            return {"streamers": found, "games": []}
+        return {}
+
+
+def _fetch_clips_by_game(game_name: str, count: int = 5) -> list:
+    """Fetch top clips for a Twitch game category."""
+    token = _get_twitch_token()
+    # Search for game ID
+    try:
+        resp = requests.get(
+            "https://api.twitch.tv/helix/search/categories",
+            headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
+            params={"query": game_name, "first": 1},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        categories = resp.json().get("data", [])
+        if not categories:
+            log.warning("No Twitch category found for '%s'", game_name)
+            return []
+        game_id = categories[0]["id"]
+        log.info("Found game '%s' → ID %s", categories[0]["name"], game_id)
+    except Exception as exc:
+        log.warning("Game search failed for '%s': %s", game_name, exc)
+        return []
+
+    # Fetch clips by game_id
+    urls = []
+    try:
+        resp = requests.get(
+            "https://api.twitch.tv/helix/clips",
+            headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
+            params={"game_id": game_id, "first": count},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        for clip in resp.json().get("data", []):
+            slug = clip.get("id", "")
+            if slug:
+                try:
+                    url = _get_clip_source_url(slug)
+                    urls.append(url)
+                except Exception as exc:
+                    log.warning("Failed to resolve game clip %s: %s", slug, exc)
+    except Exception as exc:
+        log.warning("Game clip fetch failed: %s", exc)
+    return urls
+
+
 def fetch_clip_urls(streamers: list, count: int = 3) -> list:
     """Fetch Twitch clip slugs and resolve to download URLs."""
     token = _get_twitch_token()
@@ -748,6 +835,64 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     log.info("Generated ASS captions with %d chunks for %.1fs", len(events), duration)
 
 
+def _assign_captions_to_clips(boundaries: list, num_clips: int, vo_duration: float) -> list:
+    """Map TTS sentence boundaries to per-clip caption chunks.
+
+    Returns a list of lists: one per clip. Each inner list has dicts:
+    {"start": float, "end": float, "text": str} with clip-relative times.
+    """
+    per_clip_dur = vo_duration / max(num_clips, 1)
+    result = [[] for _ in range(num_clips)]
+
+    for boundary in boundaries:
+        sent_start = boundary["offset_s"]
+        sent_dur = boundary["duration_s"]
+        words = boundary["text"].split()
+        if not words:
+            continue
+
+        # Split into 2-word chunks
+        chunks = []
+        for j in range(0, len(words), 2):
+            chunks.append(" ".join(words[j:j + 2]))
+
+        time_per_chunk = sent_dur / max(len(chunks), 1)
+
+        for ci, chunk in enumerate(chunks):
+            abs_start = sent_start + ci * time_per_chunk
+            abs_end = sent_start + (ci + 1) * time_per_chunk
+            # Determine which clip this falls in
+            clip_idx = min(int(abs_start / per_clip_dur), num_clips - 1)
+            clip_start = clip_idx * per_clip_dur
+            result[clip_idx].append({
+                "start": abs_start - clip_start,
+                "end": abs_end - clip_start,
+                "text": chunk.upper(),
+            })
+
+    return result
+
+
+def _build_drawtext_chain(chunks: list) -> str:
+    """Build FFmpeg drawtext filter chain for per-clip captions.
+
+    Each chunk: {"start": float, "end": float, "text": str}
+    Returns a comma-separated drawtext filter string.
+    """
+    parts = []
+    for ch in chunks:
+        text = ch["text"].replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
+        if not text.strip():
+            continue
+        parts.append(
+            f"drawtext=text='{text}':fontsize=52:fontcolor=white:"
+            f"borderw=4:bordercolor=black:"
+            f"x=(w-text_w)/2:y=h*0.72:"
+            f"enable='between(t,{ch['start']:.2f},{ch['end']:.2f})'"
+        )
+    return ",".join(parts)
+
+
 # Background music: phonk-style bass beat generated with FFmpeg
 _BG_MUSIC_CACHE = TEMP_DIR / "bg_phonk.mp3"
 
@@ -796,7 +941,7 @@ def _get_bg_music(duration: float = 120) -> Path | None:
     return None
 
 
-def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "") -> tuple:
+def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "", hook_text: str = "") -> tuple:
     """Download clips, generate TTS with edge-tts, assemble 9:16 video with captions + music. Returns (video_path, duration)."""
     _cleanup_temp()
 
@@ -867,24 +1012,43 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 0.5
 
-    # Prepare hook text for first clip (bold text overlay for first 3 seconds)
-    hook_text = topic.upper()[:50] if topic else "WATCH THIS"
-    # Escape special chars for FFmpeg drawtext
-    hook_safe = hook_text.replace("'", "").replace(":", " -").replace("\\", "")
+    # Prepare hook text for first clip (bold text overlay for first 4 seconds)
+    if not hook_text:
+        hook_text = topic[:45] if topic else "WATCH THIS"
+    hook_text = hook_text[:45].upper()
+    hook_safe = hook_text.replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
+
+    # Assign per-clip captions from TTS boundaries
+    clip_captions = []
+    if boundaries:
+        try:
+            clip_captions = _assign_captions_to_clips(boundaries, len(use_clips), vo_duration)
+            log.info("Assigned captions to %d clips (%d total chunks)",
+                     len(clip_captions), sum(len(c) for c in clip_captions))
+        except Exception as exc:
+            log.warning("Caption assignment failed: %s", exc)
 
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
-            # First clip gets bold hook text overlay for 3 seconds
+            # Base filter: scale + crop to 9:16
+            vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
+
+            # First clip: add hook text in upper-third for 4 seconds
             if i == 0:
-                vf = (
-                    "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,"
-                    f"drawtext=text='{hook_safe}':fontsize=48:fontcolor=white:"
-                    "borderw=4:bordercolor=black:x=(w-text_w)/2:y=(h-text_h)/2:"
-                    "enable='lt(t,3)'"
+                vf += (
+                    f",drawtext=text='{hook_safe}':fontsize=56:fontcolor=white:"
+                    "borderw=5:bordercolor=black:"
+                    "box=1:boxborderw=14:boxcolor=black@0.6:"
+                    "x=(w-text_w)/2:y=h*0.18:"
+                    "enable='lt(t,4)'"
                 )
-            else:
-                vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
+
+            # Add per-clip caption drawtext chain (lower-center)
+            if i < len(clip_captions) and clip_captions[i]:
+                caption_chain = _build_drawtext_chain(clip_captions[i])
+                if caption_chain:
+                    vf += "," + caption_chain
 
             result = subprocess.run(
                 [
@@ -2065,10 +2229,36 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
         return jsonify({"error": err, "steps": results["steps"]}), 500
 
-    # Step 2: Fetch clips
+    # Step 2: Fetch clips — smart sourcing based on topic
+    clip_urls = []
     try:
-        clip_urls = fetch_clip_urls(streamers)
-        results["steps"]["clips"] = {"status": "ok", "count": len(clip_urls)}
+        # First: ask AI for relevant streamers/games
+        sources = _extract_clip_sources(topic)
+        ai_streamers = sources.get("streamers", [])
+        ai_games = sources.get("games", [])
+
+        # Try AI-suggested streamers
+        if ai_streamers:
+            clip_urls = fetch_clip_urls(ai_streamers, count=3)
+            log.info("Got %d clips from AI-suggested streamers %s", len(clip_urls), ai_streamers)
+
+        # If not enough, try game-based clips
+        if len(clip_urls) < 4 and ai_games:
+            for game in ai_games:
+                game_clips = _fetch_clips_by_game(game, count=5)
+                clip_urls.extend(game_clips)
+                log.info("Got %d clips from game '%s'", len(game_clips), game)
+                if len(clip_urls) >= 8:
+                    break
+
+        # Last resort: fall back to random DEFAULT_STREAMERS
+        if len(clip_urls) < 3:
+            fallback = random.sample(DEFAULT_STREAMERS, min(4, len(DEFAULT_STREAMERS)))
+            log.info("Falling back to random streamers: %s", fallback)
+            clip_urls.extend(fetch_clip_urls(fallback, count=3))
+
+        results["steps"]["clips"] = {"status": "ok", "count": len(clip_urls),
+                                     "sources": ai_streamers or streamers}
     except Exception as e:
         err = f"Clip fetch failed: {_sanitize(str(e))}"
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
@@ -2078,9 +2268,14 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description):
         _send_notification("❌ Pipeline Failed", "No clips found", success=False, details={"topic": topic})
         return jsonify({"error": "No clips found", "steps": results["steps"]}), 400
 
+    # Extract first sentence from script as hook text for video overlay
+    cleaned = clean_script(script_text)
+    first_sentence = re.split(r'[.?!]', cleaned)[0].strip() if cleaned else ""
+    hook_text = first_sentence if len(first_sentence) > 10 else topic[:45]
+
     # Step 3: Assemble video
     try:
-        video_path, duration = assemble_video_from_parts(script_text, clip_urls, topic=topic)
+        video_path, duration = assemble_video_from_parts(script_text, clip_urls, topic=topic, hook_text=hook_text)
         results["steps"]["video"] = {"status": "ok", "duration": duration}
     except Exception as e:
         err = f"Assembly failed: {_sanitize(str(e))}"
