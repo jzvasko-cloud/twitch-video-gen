@@ -457,10 +457,13 @@ SCRIPT STRUCTURE (strict — follow every time):
 
 [VISUAL: describe the key clip moment that matches the payoff]
 
-[CTA] — Final 5 seconds. Comment bait that splits the audience. Never generic. Always force a choice:
-  - "S tier or D tier? Comment now."
-  - "Who was actually right? Drop a name."
-  - "Am I wrong? Prove it below."
+[CTA] — Final 5-7 seconds. This is the MOST IMPORTANT part for engagement. You MUST end with a direct question or challenge that makes the viewer feel they NEED to comment. Always force a binary choice or a strong opinion. Examples:
+  - "Comment your top 3 right now. I'll pin the best one."
+  - "If you disagree, tell me who should have been number one. I'll wait."
+  - "Drop a 1 if you agree, 2 if you think I'm delusional."
+  - "Comment below — was this an L take or was I right? Be honest."
+  - "Follow for part two where I rank the rest. Comment who you want to see next."
+  The CTA MUST feel conversational, like you're talking directly to the viewer. Never say "like and subscribe" — that's dead. Ask for their OPINION.
 
 VOICE RULES:
 - CRITICAL: Total spoken words MUST be between 80-120 words (30-45 second video). Count them. This is NOT optional. Scripts under 70 spoken words will be rejected.
@@ -1033,7 +1036,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         sp = job_dir / f"scaled_{i}.mp4"
         try:
             # Base filter: scale + crop to 9:16 (center-horizontal, top-vertical)
-            vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(iw-720)/2:0,setsar=1"
+            vf = "split[bg][fg];[bg]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=25:5,setsar=1[bbg];[fg]scale=720:-2[sfg];[bbg][sfg]overlay=(W-w)/2:(H-h)/3,setsar=1"
 
             # First clip only: add hook text in upper-third for 4 seconds
             if i == 0:
@@ -1063,7 +1066,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 if i == 0:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", str(cp),
-                         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(iw-720)/2:0,setsar=1",
+                         "-vf", "split[bg][fg];[bg]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=25:5,setsar=1[bbg];[fg]scale=720:-2[sfg];[bbg][sfg]overlay=(W-w)/2:(H-h)/3,setsar=1",
                          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                          "-t", str(per_clip), str(sp)],
                         capture_output=True, timeout=180,
@@ -1133,7 +1136,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not final.exists():
         raise ValueError("Final video assembly failed")
 
-    return final, vo_duration
+    return final, vo_duration, boundaries
 
 
 def upload_to_tiktok(video_path: Path, access_token: str, description: str = "") -> str:
@@ -1264,6 +1267,49 @@ def upload_to_youtube(video_path: Path, title: str = "", description: str = "") 
     video_id = response["id"]
     log.info("YouTube upload complete: video_id=%s", video_id)
     return video_id
+
+
+def _upload_youtube_captions(video_id: str, boundaries: list):
+    """Upload SRT captions to a YouTube video from TTS sentence boundaries."""
+    if not boundaries:
+        return
+    try:
+        # Build SRT from boundaries
+        srt_lines = []
+        for i, b in enumerate(boundaries):
+            start = b["offset_s"]
+            end = start + b["duration_s"]
+            s_h, s_m = int(start // 3600), int((start % 3600) // 60)
+            s_s, s_ms = int(start % 60), int((start % 1) * 1000)
+            e_h, e_m = int(end // 3600), int((end % 3600) // 60)
+            e_s, e_ms = int(end % 60), int((end % 1) * 1000)
+            srt_lines.append(str(i + 1))
+            srt_lines.append(f"{s_h:02d}:{s_m:02d}:{s_s:02d},{s_ms:03d} --> {e_h:02d}:{e_m:02d}:{e_s:02d},{e_ms:03d}")
+            srt_lines.append(b["text"])
+            srt_lines.append("")
+
+        srt_path = TEMP_DIR / f"captions_{video_id}.srt"
+        srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
+
+        creds = _get_youtube_credentials()
+        if not creds:
+            return
+        youtube = build("youtube", "v3", credentials=creds)
+        youtube.captions().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "videoId": video_id,
+                    "language": "en",
+                    "name": "English",
+                }
+            },
+            media_body=MediaFileUpload(str(srt_path), mimetype="application/x-subrip"),
+        ).execute()
+        log.info("Uploaded SRT captions for YouTube video %s", video_id)
+        srt_path.unlink(missing_ok=True)
+    except Exception as exc:
+        log.warning("YouTube caption upload failed: %s", exc)
 
 
 def upload_to_instagram(video_path: Path, description: str = "") -> str:
@@ -2139,7 +2185,7 @@ def assemble_video_endpoint():
             return jsonify({"error": "All clip_urls must be HTTPS URLs"}), 400
 
     try:
-        video_path, duration = assemble_video_from_parts(script, clip_urls)
+        video_path, duration, _ = assemble_video_from_parts(script, clip_urls)
         return jsonify({
             "video_path": str(video_path),
             "job_id": video_path.parent.name,
@@ -2288,7 +2334,7 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
 
     # Step 3: Assemble video
     try:
-        video_path, duration = assemble_video_from_parts(script_text, clip_urls, topic=topic, hook_text=hook_text)
+        video_path, duration, tts_boundaries = assemble_video_from_parts(script_text, clip_urls, topic=topic, hook_text=hook_text)
         results["steps"]["video"] = {"status": "ok", "duration": duration}
     except Exception as e:
         err = f"Assembly failed: {_sanitize(str(e))}"
@@ -2327,6 +2373,9 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
         try:
             video_id = upload_to_youtube(video_path, title=short_title, description=description)
             results["steps"]["youtube"] = {"status": "ok", "video_id": video_id}
+            # Upload SRT captions (non-blocking, best-effort)
+            if tts_boundaries:
+                _upload_youtube_captions(video_id, tts_boundaries)
         except Exception as e:
             results["steps"]["youtube"] = {"status": "error", "error": _sanitize(str(e))}
             all_ok = False
