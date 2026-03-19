@@ -1527,7 +1527,7 @@ def preview_video():
     Auth via X-Api-Key header or ?key= query param for browser access.
     """
     key = request.headers.get("X-Api-Key", "") or request.args.get("key", "")
-    if not key or key != CLIPLORE_API_SECRET:
+    if not key or key != API_SECRET:
         abort(401)
     result = _last_pipeline_result.get("result", {})
     vpath = result.get("video_path", "")
