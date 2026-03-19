@@ -697,6 +697,8 @@ def _generate_tts_edge(script_text: str, audio_path: Path) -> list:
 def _generate_ass_captions(boundaries: list, duration: float, ass_path: Path):
     """Generate ASS subtitle file with Hormozi-style word-by-word captions."""
     # ASS header with Montserrat-style bold font, centered
+    # ASS header: bold Arial 62pt, white text, thick black outline, centered on screen
+    # Alignment 5 = center-center, MarginV=100 nudges it slightly below true center
     header = """[Script Info]
 Title: ClipLoreTV Captions
 ScriptType: v4.00+
@@ -705,7 +707,7 @@ PlayResY: 1280
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,5,20,20,200,1
+Style: Default,Arial,62,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,5,20,20,100,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -720,8 +722,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if not words:
             continue
 
-        # Split sentence into 2-3 word chunks
-        chunk_size = 3
+        # 2-word chunks for punchy Hormozi-style delivery
+        chunk_size = 2
         chunks = []
         for i in range(0, len(words), chunk_size):
             chunks.append(" ".join(words[i:i + chunk_size]))
@@ -741,24 +743,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     log.info("Generated ASS captions with %d chunks for %.1fs", len(events), duration)
 
 
-# Background music URL (royalty-free lo-fi from Pixabay)
-_BG_MUSIC_URL = "https://cdn.pixabay.com/audio/2024/11/01/audio_b5fa1190f9.mp3"
-_BG_MUSIC_CACHE = TEMP_DIR / "bg_lofi.mp3"
+# Background music: generate a subtle ambient pad with FFmpeg
+_BG_MUSIC_CACHE = TEMP_DIR / "bg_ambient.mp3"
 
 
-def _get_bg_music() -> Path | None:
-    """Download and cache background lo-fi music."""
-    if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 10000:
+def _get_bg_music(duration: float = 120) -> Path | None:
+    """Generate a subtle ambient background pad using FFmpeg synthesis."""
+    if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 5000:
         return _BG_MUSIC_CACHE
     try:
-        r = requests.get(_BG_MUSIC_URL, timeout=15)
-        r.raise_for_status()
-        _BG_MUSIC_CACHE.write_bytes(r.content)
-        log.info("Downloaded background music (%d KB)", len(r.content) // 1024)
-        return _BG_MUSIC_CACHE
+        # Layer two soft sine waves for a warm ambient pad
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i",
+                f"sine=frequency=220:duration={duration}",
+                "-f", "lavfi", "-i",
+                f"sine=frequency=330:duration={duration}",
+                "-filter_complex",
+                "[0:a]volume=0.03[a1];[1:a]volume=0.02[a2];"
+                "[a1][a2]amix=inputs=2:duration=longest,"
+                "lowpass=f=400,highpass=f=80",
+                "-c:a", "libmp3lame", "-b:a", "64k",
+                str(_BG_MUSIC_CACHE),
+            ],
+            capture_output=True, timeout=30,
+        )
+        if _BG_MUSIC_CACHE.exists():
+            log.info("Generated ambient background pad (%.0fs)", duration)
+            return _BG_MUSIC_CACHE
     except Exception as exc:
-        log.warning("Failed to download background music: %s", exc)
-        return None
+        log.warning("Failed to generate background music: %s", exc)
+    return None
 
 
 def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "") -> tuple:
@@ -879,7 +895,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
             log.warning("Caption generation failed: %s", exc)
 
     # Mix voiceover with background music
-    bg_music = _get_bg_music()
+    bg_music = _get_bg_music(duration=vo_duration + 5)
     mixed_audio = job_dir / "mixed_audio.mp3"
     if bg_music:
         try:
@@ -887,8 +903,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
             subprocess.run(
                 ["ffmpeg", "-y", "-i", str(tts_path), "-i", str(bg_music),
                  "-filter_complex",
-                 "[1:a]volume=0.10,aloop=loop=-1:size=2e+09[music];"
-                 "[0:a][music]amix=inputs=2:duration=first:dropout_transition=2",
+                 "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2",
                  "-c:a", "aac", "-b:a", "128k",
                  str(mixed_audio)],
                 capture_output=True, timeout=60,
