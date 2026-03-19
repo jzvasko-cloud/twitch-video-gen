@@ -884,15 +884,9 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Generate ASS captions if we have boundaries
-    ass_path = job_dir / "captions.ass"
-    has_captions = False
-    if boundaries:
-        try:
-            _generate_ass_captions(boundaries, vo_duration, ass_path)
-            has_captions = ass_path.exists()
-        except Exception as exc:
-            log.warning("Caption generation failed: %s", exc)
+    # NOTE: Caption burn (ASS subtitle filter) requires full video re-encode
+    # which exceeds Render free tier CPU limits (~10+ min for 60s video).
+    # YouTube auto-generates captions from the voiceover audio instead.
 
     # Mix voiceover with background music
     bg_music = _get_bg_music(duration=vo_duration + 5)
@@ -908,7 +902,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                  str(mixed_audio)],
                 capture_output=True, timeout=60,
             )
-            if not mixed_audio.exists():
+            if not mixed_audio.exists() or mixed_audio.stat().st_size < 1000:
                 mixed_audio = tts_path
         except Exception as exc:
             log.warning("Audio mixing failed: %s", exc)
@@ -916,35 +910,17 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     else:
         mixed_audio = tts_path
 
-    # Final merge: video + mixed audio + burned-in captions
-    log.info("Final merge (vo=%.1fs, %d clips, captions=%s, music=%s)",
-             vo_duration, len(scaled), has_captions, bg_music is not None)
+    # Final merge: video + mixed audio (copy video stream for speed)
+    log.info("Final merge (vo=%.1fs, %d clips, music=%s)",
+             vo_duration, len(scaled), bg_music is not None)
     final = job_dir / "final.mp4"
-
-    if has_captions:
-        ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
-                 "-vf", f"ass='{ass_escaped}'",
-                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                 "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-                 str(final)],
-                capture_output=True, timeout=180,
-            )
-        except Exception as exc:
-            log.warning("Caption burn failed: %s", exc)
-
-    # Fallback: merge without captions
-    if not final.exists() or final.stat().st_size < 1000:
-        log.warning("Merging without captions")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
-             "-c:v", "copy",
-             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-             str(final)],
-            capture_output=True, timeout=120,
-        )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
+         "-c:v", "copy",
+         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+         str(final)],
+        capture_output=True, timeout=120,
+    )
 
     if not final.exists():
         raise ValueError("Final video assembly failed")
