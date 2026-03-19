@@ -748,34 +748,48 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     log.info("Generated ASS captions with %d chunks for %.1fs", len(events), duration)
 
 
-# Background music: generate a subtle ambient pad with FFmpeg
-_BG_MUSIC_CACHE = TEMP_DIR / "bg_ambient.mp3"
+# Background music: phonk-style bass beat generated with FFmpeg
+_BG_MUSIC_CACHE = TEMP_DIR / "bg_phonk.mp3"
 
 
 def _get_bg_music(duration: float = 120) -> Path | None:
-    """Generate a subtle ambient background pad using FFmpeg synthesis."""
+    """Generate a phonk-style bass beat using FFmpeg synthesis.
+
+    Creates a deep 808-style sub-bass pulse at ~140 BPM with a higher
+    percussion click layered on top — the core phonk aesthetic.
+    """
     if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 5000:
         return _BG_MUSIC_CACHE
     try:
-        # Layer two soft sine waves for a warm ambient pad
+        # 140 BPM = pulse every 0.4286s
+        # Bass: 55Hz sine pulsed at 140 BPM with fast decay
+        # Hi-hat: 8000Hz noise burst on every other beat
         subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-f", "lavfi", "-i",
-                f"sine=frequency=220:duration={duration}",
+                f"sine=frequency=55:duration={duration}",
                 "-f", "lavfi", "-i",
-                f"sine=frequency=330:duration={duration}",
+                f"sine=frequency=110:duration={duration}",
+                "-f", "lavfi", "-i",
+                f"anoisesrc=d={duration}:c=pink:a=0.03",
                 "-filter_complex",
-                "[0:a]volume=0.03[a1];[1:a]volume=0.02[a2];"
-                "[a1][a2]amix=inputs=2:duration=longest,"
-                "lowpass=f=400,highpass=f=80",
-                "-c:a", "libmp3lame", "-b:a", "64k",
+                # Pulse the bass at ~140 BPM with tremolo
+                "[0:a]volume=0.06,tremolo=f=5.6:d=0.8[bass];"
+                # Sub-harmonic for that 808 weight
+                "[1:a]volume=0.03,tremolo=f=2.8:d=0.6[sub];"
+                # Pink noise as hi-hat texture
+                "[2:a]highpass=f=6000,lowpass=f=12000,tremolo=f=11.2:d=0.9[hat];"
+                # Mix and shape
+                "[bass][sub][hat]amix=inputs=3:duration=longest,"
+                "lowpass=f=15000,compand=attacks=0.01:decays=0.1:points=-80/-80|-20/-10|0/-3",
+                "-c:a", "libmp3lame", "-b:a", "96k",
                 str(_BG_MUSIC_CACHE),
             ],
             capture_output=True, timeout=30,
         )
         if _BG_MUSIC_CACHE.exists():
-            log.info("Generated ambient background pad (%.0fs)", duration)
+            log.info("Generated phonk background beat (%.0fs)", duration)
             return _BG_MUSIC_CACHE
     except Exception as exc:
         log.warning("Failed to generate background music: %s", exc)
@@ -845,20 +859,37 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale clips to 720x1280 (9:16) — use up to 6 clips at ~6s each
-    # for faster cuts that keep viewer attention
-    max_clips = min(len(clip_paths), max(int(vo_duration / 6), 3))
+    # Scale clips to 720x1280 (9:16) — use up to 8 clips at ~5-7s each
+    # for faster cuts that keep viewer attention (research: 7-12 clips ideal)
+    max_clips = min(len(clip_paths), max(int(vo_duration / 5), 4))
     use_clips = clip_paths[:max_clips]
     log.info("Scaling %d clips to 720x1280 (~%.0fs each)", len(use_clips), vo_duration / len(use_clips))
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 0.5
+
+    # Prepare hook text for first clip (bold text overlay for first 3 seconds)
+    hook_text = topic.upper()[:50] if topic else "WATCH THIS"
+    # Escape special chars for FFmpeg drawtext
+    hook_safe = hook_text.replace("'", "").replace(":", " -").replace("\\", "")
+
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
+            # First clip gets bold hook text overlay for 3 seconds
+            if i == 0:
+                vf = (
+                    "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,"
+                    f"drawtext=text='{hook_safe}':fontsize=48:fontcolor=white:"
+                    "borderw=4:bordercolor=black:x=(w-text_w)/2:y=(h-text_h)/2:"
+                    "enable='lt(t,3)'"
+                )
+            else:
+                vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
+
             result = subprocess.run(
                 [
                     "ffmpeg", "-y", "-i", str(cp),
-                    "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+                    "-vf", vf,
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                     "-t", str(per_clip),
                     str(sp),
@@ -869,8 +900,20 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 scaled.append(sp)
                 log.info("Scaled clip %d/%d (%.0fs)", i + 1, len(use_clips), per_clip)
             else:
-                log.warning("Clip %d scaling produced no output: %s", i,
-                            result.stderr[-200:] if result.stderr else "")
+                # Fallback without drawtext if it fails (font issues)
+                if i == 0:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(cp),
+                         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+                         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
+                         "-t", str(per_clip), str(sp)],
+                        capture_output=True, timeout=180,
+                    )
+                    if sp.exists():
+                        scaled.append(sp)
+                else:
+                    log.warning("Clip %d scaling produced no output: %s", i,
+                                result.stderr[-200:] if result.stderr else "")
         except subprocess.TimeoutExpired:
             log.warning("Clip %d scaling timed out after 180s, skipping", i)
         except Exception as exc:
