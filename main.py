@@ -1032,40 +1032,14 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 0.5
 
-    # Prepare hook text for first clip — split into 2 short lines for readability
-    if not hook_text:
-        hook_text = topic if topic else "WATCH THIS"
-    hook_upper = hook_text.upper()[:50]
-    # Split into 2 lines at the midpoint word boundary
-    words = hook_upper.split()
-    mid = len(words) // 2
-    line1 = " ".join(words[:mid]) if mid > 0 else hook_upper
-    line2 = " ".join(words[mid:]) if mid > 0 else ""
-    # Escape for FFmpeg drawtext
-    def _esc(t): return t.replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
+    # NOTE: drawtext filters cause encoding timeouts on Render free tier
+    # even for a single clip. Text overlays are not feasible. The narration
+    # hook + YouTube title serve as the hook instead.
 
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
             vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
-
-            # First clip: 2-line hook text, large font, dark box, 4 seconds
-            if i == 0:
-                vf += (
-                    f",drawtext=text='{_esc(line1)}':fontsize=64:fontcolor=white:"
-                    "borderw=5:bordercolor=black:"
-                    "box=1:boxborderw=16:boxcolor=black@0.7:"
-                    "x=(w-text_w)/2:y=h*0.35:"
-                    "enable='lt(t,4)'"
-                )
-                if line2:
-                    vf += (
-                        f",drawtext=text='{_esc(line2)}':fontsize=64:fontcolor=white:"
-                        "borderw=5:bordercolor=black:"
-                        "box=1:boxborderw=16:boxcolor=black@0.7:"
-                        "x=(w-text_w)/2:y=h*0.35+80:"
-                        "enable='lt(t,4)'"
-                    )
 
             result = subprocess.run(
                 [
