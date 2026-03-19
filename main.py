@@ -838,41 +838,42 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 def _assign_captions_to_clips(boundaries: list, num_clips: int, vo_duration: float) -> list:
     """Map TTS sentence boundaries to per-clip caption chunks.
 
+    Uses exact sentence timing from edge-tts (not estimated word chunks)
+    to ensure captions are perfectly synced with speech.
+
     Returns a list of lists: one per clip. Each inner list has dicts:
     {"start": float, "end": float, "text": str} with clip-relative times.
     """
     per_clip_dur = vo_duration / max(num_clips, 1)
     result = [[] for _ in range(num_clips)]
 
-    # edge-tts sentence boundaries can have a small initial delay;
-    # shift captions slightly earlier so they appear WITH the speech
-    caption_offset = boundaries[0]["offset_s"] if boundaries else 0
-
     for boundary in boundaries:
-        sent_start = boundary["offset_s"] - caption_offset
+        sent_start = boundary["offset_s"]
         sent_dur = boundary["duration_s"]
-        words = boundary["text"].split()
-        if not words:
+        text = boundary["text"].strip()
+        if not text:
             continue
 
-        # Split into 2-word chunks
-        chunks = []
-        for j in range(0, len(words), 2):
-            chunks.append(" ".join(words[j:j + 2]))
+        # Truncate long sentences for readability on screen
+        display = text.upper()
+        if len(display) > 60:
+            display = display[:57] + "..."
 
-        time_per_chunk = sent_dur / max(len(chunks), 1)
+        # Determine which clip this sentence starts in
+        clip_idx = min(int(sent_start / per_clip_dur), num_clips - 1)
+        clip_start = clip_idx * per_clip_dur
 
-        for ci, chunk in enumerate(chunks):
-            abs_start = sent_start + ci * time_per_chunk
-            abs_end = sent_start + (ci + 1) * time_per_chunk
-            # Determine which clip this falls in
-            clip_idx = min(int(abs_start / per_clip_dur), num_clips - 1)
-            clip_start = clip_idx * per_clip_dur
-            result[clip_idx].append({
-                "start": abs_start - clip_start,
-                "end": abs_end - clip_start,
-                "text": chunk.upper(),
-            })
+        # If sentence spans into next clip, clamp end to this clip's boundary
+        rel_start = sent_start - clip_start
+        rel_end = rel_start + sent_dur
+        if rel_end > per_clip_dur + 0.5:
+            rel_end = per_clip_dur + 0.5
+
+        result[clip_idx].append({
+            "start": max(rel_start, 0),
+            "end": rel_end,
+            "text": display,
+        })
 
     return result
 
@@ -889,9 +890,10 @@ def _build_drawtext_chain(chunks: list) -> str:
         if not text.strip():
             continue
         parts.append(
-            f"drawtext=text='{text}':fontsize=52:fontcolor=white:"
-            f"borderw=4:bordercolor=black:"
-            f"x=(w-text_w)/2:y=h*0.55:"
+            f"drawtext=text='{text}':fontsize=38:fontcolor=white:"
+            f"borderw=3:bordercolor=black:"
+            f"box=1:boxborderw=8:boxcolor=black@0.5:"
+            f"x=(w-text_w)/2:y=h*0.82:"
             f"enable='between(t,{ch['start']:.2f},{ch['end']:.2f})'"
         )
     return ",".join(parts)
@@ -1037,7 +1039,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         sp = job_dir / f"scaled_{i}.mp4"
         try:
             # Base filter: scale + crop to 9:16
-            vf = "scale=720:-2,pad=720:1280:0:0:black,setsar=1"
+            vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(iw-720)/2:0,setsar=1"
 
             # First clip: add hook text in upper-third for 4 seconds
             if i == 0:
@@ -1073,7 +1075,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 if i == 0:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", str(cp),
-                         "-vf", "scale=720:-2,pad=720:1280:0:0:black,setsar=1",
+                         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(iw-720)/2:0,setsar=1",
                          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                          "-t", str(per_clip), str(sp)],
                         capture_output=True, timeout=180,
