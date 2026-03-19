@@ -84,7 +84,12 @@ PILLAR_PREFIXES = {
 }
 VALID_PILLARS = set(PILLAR_PREFIXES.keys()) | {""}
 
-DEFAULT_STREAMERS = ["xqc", "pokimane", "asmongold", "hasanabi", "shroud", "nickmercs", "timthetatman"]
+DEFAULT_STREAMERS = [
+    # Variety/gaming streamers with clip-heavy content
+    "xqc", "asmongold", "shroud", "timthetatman", "nickmercs",
+    "summit1g", "lirik", "sodapoppin", "forsen", "tyler1",
+    "kai_cenat", "adin", "caseoh_", "ironmouse", "caedrel",
+]
 
 # ---------------------------------------------------------------------------
 # Encrypted token storage — persisted to Render env vars via API
@@ -467,7 +472,7 @@ VOICE RULES:
 - Reference specific moments, usernames, or events — never be vague
 
 OUTPUT FORMAT:
-Return ONLY the narration script text that will be read aloud. Do NOT include [VISUAL] tags, [HOOK] tags, [BUILD] tags, [PAYOFF] tags, [CTA] tags, or any markdown formatting. Just write the pure spoken words, 120-180 words total, as one continuous script. No headers, no notes, no meta-commentary, no tags of any kind."""
+Return ONLY the narration script text that will be read aloud. Do NOT include [VISUAL] tags, [HOOK] tags, [BUILD] tags, [PAYOFF] tags, [CTA] tags, or any markdown formatting. Just write the pure spoken words, 80-120 words total, as one continuous script. No headers, no notes, no meta-commentary, no tags of any kind."""
 
 
 # ===================================================================
@@ -840,12 +845,13 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale each clip to 720x1280 (9:16)
-    # Limit to 3 clips max to keep encoding time reasonable on free tier
-    use_clips = clip_paths[:3]
-    log.info("Scaling %d clips to 720x1280", len(use_clips))
+    # Scale clips to 720x1280 (9:16) — use up to 6 clips at ~6s each
+    # for faster cuts that keep viewer attention
+    max_clips = min(len(clip_paths), max(int(vo_duration / 6), 3))
+    use_clips = clip_paths[:max_clips]
+    log.info("Scaling %d clips to 720x1280 (~%.0fs each)", len(use_clips), vo_duration / len(use_clips))
     scaled = []
-    per_clip = vo_duration / max(len(use_clips), 1) + 1
+    per_clip = vo_duration / max(len(use_clips), 1) + 0.5
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
@@ -1982,7 +1988,7 @@ def cron():
     tiktok_token = _get_tiktok_token()
 
     data = request.get_json(silent=True) or {}
-    streamers = data.get("streamers", random.sample(DEFAULT_STREAMERS, min(3, len(DEFAULT_STREAMERS))))
+    streamers = data.get("streamers", random.sample(DEFAULT_STREAMERS, min(4, len(DEFAULT_STREAMERS))))
     description = data.get("description", "#twitch #gaming #streamer #cliploretv #shorts")
 
     topic, pillar = _pick_topic()
