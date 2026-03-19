@@ -1025,23 +1025,17 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     hook_text = hook_text[:45].upper()
     hook_safe = hook_text.replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
 
-    # Assign per-clip captions from TTS boundaries
-    clip_captions = []
-    if boundaries:
-        try:
-            clip_captions = _assign_captions_to_clips(boundaries, len(use_clips), vo_duration)
-            log.info("Assigned captions to %d clips (%d total chunks)",
-                     len(clip_captions), sum(len(c) for c in clip_captions))
-        except Exception as exc:
-            log.warning("Caption assignment failed: %s", exc)
+    # NOTE: Per-clip caption burn via drawtext is too slow for Render free
+    # tier (~3x encoding time per clip, causes timeouts). YouTube auto-CC
+    # from the clear edge-tts voice provides captions instead.
 
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
-            # Base filter: scale + crop to 9:16
+            # Base filter: scale + crop to 9:16 (center-horizontal, top-vertical)
             vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280:(iw-720)/2:0,setsar=1"
 
-            # First clip: add hook text in upper-third for 4 seconds
+            # First clip only: add hook text in upper-third for 4 seconds
             if i == 0:
                 vf += (
                     f",drawtext=text='{hook_safe}':fontsize=56:fontcolor=white:"
@@ -1050,12 +1044,6 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                     "x=(w-text_w)/2:y=h*0.18:"
                     "enable='lt(t,4)'"
                 )
-
-            # Add per-clip caption drawtext chain (lower-center)
-            if i < len(clip_captions) and clip_captions[i]:
-                caption_chain = _build_drawtext_chain(clip_captions[i])
-                if caption_chain:
-                    vf += "," + caption_chain
 
             result = subprocess.run(
                 [
