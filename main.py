@@ -1156,7 +1156,7 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
         json={
             "post_info": {
                 "title": (description[:150]) if description else "ClipLoreTV",
-                "privacy_level": "PUBLIC_TO_EVERYONE",
+                "privacy_level": "SELF_ONLY",
                 "disable_duet": False,
                 "disable_comment": False,
                 "disable_stitch": False,
@@ -1170,7 +1170,9 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
         },
         timeout=30,
     )
-    init_resp.raise_for_status()
+    if init_resp.status_code != 200:
+        log.error("TikTok init failed (%d): %s", init_resp.status_code, init_resp.text[:500])
+        init_resp.raise_for_status()
     init_data = init_resp.json()
 
     if init_data.get("error", {}).get("code") != "ok":
