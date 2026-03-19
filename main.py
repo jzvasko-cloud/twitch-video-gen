@@ -21,13 +21,15 @@ import secrets
 import base64
 from pathlib import Path
 
+import asyncio
+
 import requests
+import edge_tts
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request, jsonify, redirect, abort, send_file
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from gtts import gTTS
 
 app = Flask(__name__)
 
@@ -456,7 +458,7 @@ SCRIPT STRUCTURE (strict — follow every time):
   - "Am I wrong? Prove it below."
 
 VOICE RULES:
-- CRITICAL: Total spoken words MUST be between 120-180 words. Count them. This is NOT optional. Scripts under 100 spoken words will be rejected and you will have to redo them.
+- CRITICAL: Total spoken words MUST be between 80-120 words (30-45 second video). Count them. This is NOT optional. Scripts under 70 spoken words will be rejected.
 - Tone: confident, slightly cocky, like a friend who watches too much Twitch
 - No "Hey guys," no "Welcome back," no intro fluff — open cold
 - Short sentences. Punchy. Never more than 15 words per sentence.
@@ -472,8 +474,10 @@ Return ONLY the narration script text that will be read aloud. Do NOT include [V
 #  Core logic — reusable functions (no Flask request dependency)
 # ===================================================================
 
-MIN_SCRIPT_WORDS = 100
+MIN_SCRIPT_WORDS = 70
 MAX_SCRIPT_RETRIES = 3
+EDGE_TTS_VOICE = "en-US-ChristopherNeural"
+EDGE_TTS_RATE = "+5%"
 
 
 def _call_gemini(user_msg: str) -> str | None:
@@ -546,9 +550,9 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
             user_msg = (
                 base_msg
                 + f"\n\nIMPORTANT: Your previous script was only {word_count} words. "
-                "That is WAY too short. You MUST write at least 120 words. "
-                "Include a full [HOOK], [BUILD] with 3-4 beats, [PAYOFF], and [CTA]. "
-                "Make it 40-60 seconds when read aloud."
+                "That is WAY too short. You MUST write at least 80 words. "
+                "Include a full hook, build with 3-4 beats, payoff, and CTA. "
+                "Make it 30-45 seconds when read aloud."
             )
 
         # Try Gemini first, then Claude
@@ -665,50 +669,117 @@ def _fetch_pexels_clips(query: str = "gaming esports", count: int = 3) -> list:
         return []
 
 
-def _generate_srt(script_text: str, duration: float, srt_path: Path):
-    """Generate an SRT subtitle file with ~3-word chunks timed across the duration."""
+def _generate_tts_edge(script_text: str, audio_path: Path) -> list:
+    """Generate TTS audio using edge-tts and return sentence boundaries.
+
+    Returns list of dicts: [{"offset_s": float, "duration_s": float, "text": str}, ...]
+    """
     cleaned = clean_script(script_text)
-    words = cleaned.split()
-    if not words:
-        return
 
-    # Group into chunks of 3-4 words for punchy captions
-    chunk_size = 3
-    chunks = []
-    for i in range(0, len(words), chunk_size):
-        chunks.append(" ".join(words[i:i + chunk_size]))
+    async def _run():
+        communicate = edge_tts.Communicate(cleaned, EDGE_TTS_VOICE, rate=EDGE_TTS_RATE)
+        boundaries = []
+        with open(audio_path, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+                elif chunk["type"] == "SentenceBoundary":
+                    boundaries.append({
+                        "offset_s": chunk["offset"] / 10_000_000,
+                        "duration_s": chunk["duration"] / 10_000_000,
+                        "text": chunk["text"],
+                    })
+        return boundaries
 
-    time_per_chunk = duration / len(chunks)
-    lines = []
-    for i, chunk in enumerate(chunks):
-        start = i * time_per_chunk
-        end = min((i + 1) * time_per_chunk, duration)
-        # SRT time format: HH:MM:SS,mmm
-        s_h, s_m = int(start // 3600), int((start % 3600) // 60)
-        s_s, s_ms = int(start % 60), int((start % 1) * 1000)
-        e_h, e_m = int(end // 3600), int((end % 3600) // 60)
-        e_s, e_ms = int(end % 60), int((end % 1) * 1000)
-        lines.append(f"{i + 1}")
-        lines.append(f"{s_h:02d}:{s_m:02d}:{s_s:02d},{s_ms:03d} --> {e_h:02d}:{e_m:02d}:{e_s:02d},{e_ms:03d}")
-        lines.append(chunk.upper())
-        lines.append("")
+    return asyncio.run(_run())
 
-    srt_path.write_text("\n".join(lines), encoding="utf-8")
-    log.info("Generated SRT with %d subtitle chunks for %.1fs video", len(chunks), duration)
+
+def _generate_ass_captions(boundaries: list, duration: float, ass_path: Path):
+    """Generate ASS subtitle file with Hormozi-style word-by-word captions."""
+    # ASS header with Montserrat-style bold font, centered
+    header = """[Script Info]
+Title: ClipLoreTV Captions
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,5,20,20,200,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events = []
+
+    for boundary in boundaries:
+        sentence = boundary["text"]
+        sent_start = boundary["offset_s"]
+        sent_dur = boundary["duration_s"]
+        words = sentence.split()
+        if not words:
+            continue
+
+        # Split sentence into 2-3 word chunks
+        chunk_size = 3
+        chunks = []
+        for i in range(0, len(words), chunk_size):
+            chunks.append(" ".join(words[i:i + chunk_size]))
+
+        time_per_chunk = sent_dur / max(len(chunks), 1)
+
+        for i, chunk in enumerate(chunks):
+            cs = sent_start + i * time_per_chunk
+            ce = sent_start + (i + 1) * time_per_chunk
+            # ASS time format: H:MM:SS.cc
+            s_str = f"{int(cs//3600)}:{int((cs%3600)//60):02d}:{int(cs%60):02d}.{int((cs%1)*100):02d}"
+            e_str = f"{int(ce//3600)}:{int((ce%3600)//60):02d}:{int(ce%60):02d}.{int((ce%1)*100):02d}"
+            text_upper = chunk.upper().replace("\\", "\\\\")
+            events.append(f"Dialogue: 0,{s_str},{e_str},Default,,0,0,0,,{text_upper}")
+
+    ass_path.write_text(header + "\n".join(events), encoding="utf-8")
+    log.info("Generated ASS captions with %d chunks for %.1fs", len(events), duration)
+
+
+# Background music URL (royalty-free lo-fi from Pixabay)
+_BG_MUSIC_URL = "https://cdn.pixabay.com/audio/2024/11/01/audio_b5fa1190f9.mp3"
+_BG_MUSIC_CACHE = TEMP_DIR / "bg_lofi.mp3"
+
+
+def _get_bg_music() -> Path | None:
+    """Download and cache background lo-fi music."""
+    if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 10000:
+        return _BG_MUSIC_CACHE
+    try:
+        r = requests.get(_BG_MUSIC_URL, timeout=15)
+        r.raise_for_status()
+        _BG_MUSIC_CACHE.write_bytes(r.content)
+        log.info("Downloaded background music (%d KB)", len(r.content) // 1024)
+        return _BG_MUSIC_CACHE
+    except Exception as exc:
+        log.warning("Failed to download background music: %s", exc)
+        return None
 
 
 def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "") -> tuple:
-    """Download clips, generate TTS, assemble 9:16 video with captions. Returns (video_path, duration)."""
+    """Download clips, generate TTS with edge-tts, assemble 9:16 video with captions + music. Returns (video_path, duration)."""
     _cleanup_temp()
 
     job_id = uuid.uuid4().hex[:10]
     job_dir = TEMP_DIR / job_id
     job_dir.mkdir(exist_ok=True)
 
-    # TTS voiceover
+    # TTS voiceover with edge-tts (Microsoft neural voice)
     tts_path = job_dir / "voiceover.mp3"
-    tts = gTTS(text=clean_script(script_text), lang="en", tld="co.uk")
-    tts.save(str(tts_path))
+    log.info("Generating TTS with edge-tts (%s)", EDGE_TTS_VOICE)
+    try:
+        boundaries = _generate_tts_edge(script_text, tts_path)
+    except Exception as exc:
+        log.warning("edge-tts failed (%s), falling back to gTTS", exc)
+        from gtts import gTTS
+        tts = gTTS(text=clean_script(script_text), lang="en", tld="co.uk")
+        tts.save(str(tts_path))
+        boundaries = []
 
     probe = subprocess.run(
         ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(tts_path)],
@@ -753,30 +824,48 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale each clip to 720x1280 (9:16) — 720p is fast to encode on free tier
+    # Scale each clip to 720x1280 (9:16) with Ken Burns zoom effect
     # Limit to 3 clips max to keep encoding time reasonable
     use_clips = clip_paths[:3]
-    log.info("Scaling %d clips to 720x1280", len(use_clips))
+    log.info("Scaling %d clips to 720x1280 with zoom", len(use_clips))
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 1
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
+            # Scale + crop to 9:16, then apply slow Ken Burns zoom (5% over clip duration)
+            vf = (
+                "scale=760:1350:force_original_aspect_ratio=increase,"
+                "crop=760:1350,setsar=1,"
+                "zoompan=z='min(zoom+0.0003,1.06)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                ":d=1:s=720x1280:fps=30"
+            )
             result = subprocess.run(
                 [
                     "ffmpeg", "-y", "-i", str(cp),
-                    "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+                    "-vf", vf,
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                     "-t", str(per_clip),
                     str(sp),
                 ],
                 capture_output=True, timeout=180,
             )
-            if sp.exists():
+            if sp.exists() and sp.stat().st_size > 1000:
                 scaled.append(sp)
                 log.info("Scaled clip %d/%d (%.0fs)", i + 1, len(use_clips), per_clip)
             else:
-                log.warning("Clip %d scaling produced no output: %s", i, result.stderr[-200:] if result.stderr else "")
+                # Fallback without zoom if zoompan fails
+                log.warning("Zoom failed for clip %d, trying without zoom", i)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(cp),
+                     "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
+                     "-t", str(per_clip), str(sp)],
+                    capture_output=True, timeout=180,
+                )
+                if sp.exists():
+                    scaled.append(sp)
+                    log.info("Scaled clip %d/%d without zoom (%.0fs)", i + 1, len(use_clips), per_clip)
         except subprocess.TimeoutExpired:
             log.warning("Clip %d scaling timed out after 180s, skipping", i)
         except Exception as exc:
@@ -796,16 +885,68 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Merge video + voiceover (copy video stream, only encode audio)
-    log.info("Merging video + voiceover (vo_duration=%.1fs, %d scaled clips)", vo_duration, len(scaled))
+    # Generate ASS captions if we have boundaries
+    ass_path = job_dir / "captions.ass"
+    has_captions = False
+    if boundaries:
+        try:
+            _generate_ass_captions(boundaries, vo_duration, ass_path)
+            has_captions = ass_path.exists()
+        except Exception as exc:
+            log.warning("Caption generation failed: %s", exc)
+
+    # Mix voiceover with background music
+    bg_music = _get_bg_music()
+    mixed_audio = job_dir / "mixed_audio.mp3"
+    if bg_music:
+        try:
+            log.info("Mixing voiceover with background music")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(tts_path), "-i", str(bg_music),
+                 "-filter_complex",
+                 "[1:a]volume=0.10,aloop=loop=-1:size=2e+09[music];"
+                 "[0:a][music]amix=inputs=2:duration=first:dropout_transition=2",
+                 "-c:a", "aac", "-b:a", "128k",
+                 str(mixed_audio)],
+                capture_output=True, timeout=60,
+            )
+            if not mixed_audio.exists():
+                mixed_audio = tts_path
+        except Exception as exc:
+            log.warning("Audio mixing failed: %s", exc)
+            mixed_audio = tts_path
+    else:
+        mixed_audio = tts_path
+
+    # Final merge: video + mixed audio + burned-in captions
+    log.info("Final merge (vo=%.1fs, %d clips, captions=%s, music=%s)",
+             vo_duration, len(scaled), has_captions, bg_music is not None)
     final = job_dir / "final.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(tts_path),
-         "-c:v", "copy",
-         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-         str(final)],
-        capture_output=True, timeout=120,
-    )
+
+    if has_captions:
+        ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
+                 "-vf", f"ass='{ass_escaped}'",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                 "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+                 str(final)],
+                capture_output=True, timeout=180,
+            )
+        except Exception as exc:
+            log.warning("Caption burn failed: %s", exc)
+
+    # Fallback: merge without captions
+    if not final.exists() or final.stat().st_size < 1000:
+        log.warning("Merging without captions")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
+             "-c:v", "copy",
+             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+             str(final)],
+            capture_output=True, timeout=120,
+        )
 
     if not final.exists():
         raise ValueError("Final video assembly failed")
