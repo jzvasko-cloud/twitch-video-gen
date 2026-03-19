@@ -444,7 +444,17 @@ CLIPLORE_SYSTEM_PROMPT = """You are a short-form video scriptwriter for ClipLore
 
 SCRIPT STRUCTURE (strict — follow every time):
 
-[HOOK] — First 3-4 seconds. A provocative question OR a shocking one-liner that immediately tells the viewer WHAT this video is about and WHY they should care. The viewer just scrolled to this with ZERO context. The hook MUST work as a standalone sentence that establishes the topic. It MUST contain at least one specific name, event, or claim. Examples: "Did HasanAbi actually destroy Destiny, or did everyone just miss the point?" / "xQc just proved why Twitch will never beat YouTube." NEVER start with a generic line like "Let me tell you something" or "This is going to shock you" — those could apply to any video and get swiped instantly.
+[HOOK] — First sentence. THIS IS THE MOST IMPORTANT LINE. It decides if the viewer stays or swipes. Rules:
+  1. It MUST be a direct question or bold claim about a SPECIFIC streamer/event
+  2. It MUST make the viewer think "wait, what?" or "no way, that's wrong"
+  3. It MUST contain at least one proper name (streamer, platform, event)
+  4. Keep it under 12 words
+  GOOD: "Ninja left Twitch and it was the worst deal in streaming history."
+  GOOD: "Why does everyone pretend xQc isn't ruining Twitch?"
+  GOOD: "DrDisrespect got banned and nobody actually knows why."
+  BAD: "Let me tell you something about streaming." (generic, no names)
+  BAD: "This might be controversial." (vague, could be any video)
+  BAD: "Here's what nobody talks about." (no specifics)
 
 [VISUAL: describe what clip footage should show during this section]
 
@@ -1022,31 +1032,40 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 0.5
 
-    # Prepare hook text for first clip (bold text overlay for first 4 seconds)
+    # Prepare hook text for first clip — split into 2 short lines for readability
     if not hook_text:
-        hook_text = topic[:45] if topic else "WATCH THIS"
-    hook_text = hook_text[:45].upper()
-    hook_safe = hook_text.replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
-
-    # NOTE: Per-clip caption burn via drawtext is too slow for Render free
-    # tier (~3x encoding time per clip, causes timeouts). YouTube auto-CC
-    # from the clear edge-tts voice provides captions instead.
+        hook_text = topic if topic else "WATCH THIS"
+    hook_upper = hook_text.upper()[:50]
+    # Split into 2 lines at the midpoint word boundary
+    words = hook_upper.split()
+    mid = len(words) // 2
+    line1 = " ".join(words[:mid]) if mid > 0 else hook_upper
+    line2 = " ".join(words[mid:]) if mid > 0 else ""
+    # Escape for FFmpeg drawtext
+    def _esc(t): return t.replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
 
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
-            # Base filter: scale + crop to 9:16 (center-horizontal, top-vertical)
             vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
 
-            # First clip only: add hook text in upper-third for 4 seconds
+            # First clip: 2-line hook text, large font, dark box, 4 seconds
             if i == 0:
                 vf += (
-                    f",drawtext=text='{hook_safe}':fontsize=56:fontcolor=white:"
+                    f",drawtext=text='{_esc(line1)}':fontsize=64:fontcolor=white:"
                     "borderw=5:bordercolor=black:"
-                    "box=1:boxborderw=14:boxcolor=black@0.6:"
-                    "x=(w-text_w)/2:y=h*0.18:"
+                    "box=1:boxborderw=16:boxcolor=black@0.7:"
+                    "x=(w-text_w)/2:y=h*0.35:"
                     "enable='lt(t,4)'"
                 )
+                if line2:
+                    vf += (
+                        f",drawtext=text='{_esc(line2)}':fontsize=64:fontcolor=white:"
+                        "borderw=5:bordercolor=black:"
+                        "box=1:boxborderw=16:boxcolor=black@0.7:"
+                        "x=(w-text_w)/2:y=h*0.35+80:"
+                        "enable='lt(t,4)'"
+                    )
 
             result = subprocess.run(
                 [
