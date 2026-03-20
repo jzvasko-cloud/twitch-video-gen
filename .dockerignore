@@ -1,0 +1,13 @@
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+venv/
+.venv/
+*.mp4
+*.mp3
+tmp/
+.claude/
+render.yaml
+Procfile
