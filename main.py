@@ -1218,11 +1218,11 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
-             "-vf", f"ass='{ass_escaped}'",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-vf", f"ass={ass_escaped}",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
              "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
              str(final)],
-            capture_output=True, timeout=300,
+            capture_output=True, timeout=480,
         )
         # If caption burn timed out or failed, fall back to no-caption merge
         if not final.exists() or final.stat().st_size < 10000:
@@ -2435,6 +2435,8 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
 
     def _err_response(err_msg, code=500):
         results["error"] = err_msg
+        _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _last_pipeline_result["result"] = results
         if _return_dict:
             raise RuntimeError(err_msg)
         return jsonify({"error": err_msg, "steps": results["steps"]}), code
