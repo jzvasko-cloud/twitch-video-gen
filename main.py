@@ -62,6 +62,8 @@ PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-d6ich8haae7s73ce1i70")
+ENCODER_URL = os.environ.get("ENCODER_URL", "")  # Cloud Run encoder service URL
+ENCODER_SECRET = os.environ.get("ENCODER_SECRET", "")  # API key for encoder service
 
 # Fail fast: require API secret in production to prevent open endpoints
 if not API_SECRET and os.environ.get("RENDER"):
@@ -1173,10 +1175,13 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Caption burn disabled — ASS subtitle re-encode exceeds Render free tier
-    # CPU limits even at 720p. TikTok/YouTube auto-generate captions from the
-    # voiceover audio. YouTube also gets SRT captions uploaded separately.
-    has_captions = False
+    # Generate ASS captions for Cloud Run (or skip if no boundaries)
+    ass_path = job_dir / "captions.ass"
+    if boundaries:
+        try:
+            _generate_ass_captions(boundaries, vo_duration, ass_path)
+        except Exception as exc:
+            log.warning("ASS caption generation failed: %s", exc)
 
     # Mix voiceover with background music
     bg_music = _get_bg_music(duration=vo_duration + 5)
@@ -1200,42 +1205,69 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     else:
         mixed_audio = tts_path
 
-    # Final merge: video + mixed audio + captions (single re-encode pass)
-    # Burning ASS subs here is efficient because we process the concat once,
-    # not per-clip. Uses ultrafast preset to stay within Render free tier limits.
-    log.info("Final merge (vo=%.1fs, %d clips, music=%s, captions=%s)",
-             vo_duration, len(scaled), bg_music is not None, has_captions)
+    # Local merge: video + audio (no re-encode, fast copy)
+    log.info("Local merge (vo=%.1fs, %d clips, music=%s)",
+             vo_duration, len(scaled), bg_music is not None)
+    merged = job_dir / "merged.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
+         "-c:v", "copy",
+         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+         str(merged)],
+        capture_output=True, timeout=120,
+    )
+
+    if not merged.exists():
+        raise ValueError("Local video merge failed")
+
+    # Cloud Run encoding: 1080p + captions + hook overlay
     final = job_dir / "final.mp4"
-
-    if has_captions:
-        # Re-encode video to burn in subtitles — single pass on the concatenated video
-        ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
-             "-vf", f"ass={ass_escaped}",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-             str(final)],
-            capture_output=True, timeout=300,
-        )
-        # If caption burn timed out or failed, fall back to no-caption merge
-        if not final.exists() or final.stat().st_size < 10000:
-            log.warning("Caption burn failed, falling back to copy merge")
-            has_captions = False
-
-    if not has_captions:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
-             "-c:v", "copy",
-             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-             str(final)],
-            capture_output=True, timeout=120,
-        )
+    if ENCODER_URL:
+        try:
+            final = _cloud_encode(merged, ass_path, hook_text, final)
+            log.info("Cloud Run encoding complete: 1080p with captions")
+        except Exception as exc:
+            log.warning("Cloud Run encoding failed (%s), using local merge", exc)
+            shutil.copy2(merged, final)
+    else:
+        # No Cloud Run — use local merge as-is (720p, no captions)
+        shutil.copy2(merged, final)
 
     if not final.exists():
         raise ValueError("Final video assembly failed")
 
     return final, vo_duration, boundaries
+
+
+def _cloud_encode(video_path: Path, ass_path: Path, hook_text: str, output_path: Path) -> Path:
+    """Send video to Cloud Run encoder for 1080p re-encode with captions."""
+    files = {"video": ("video.mp4", open(video_path, "rb"), "video/mp4")}
+    if ass_path.exists() and ass_path.stat().st_size > 50:
+        files["captions"] = ("captions.ass", open(ass_path, "rb"), "text/plain")
+
+    data = {}
+    if hook_text:
+        data["hook_text"] = hook_text
+
+    headers = {}
+    if ENCODER_SECRET:
+        headers["X-Api-Key"] = ENCODER_SECRET
+
+    log.info("Sending %.1f MB to Cloud Run encoder at %s",
+             video_path.stat().st_size / 1024 / 1024, ENCODER_URL)
+
+    resp = requests.post(
+        f"{ENCODER_URL}/encode",
+        files=files,
+        data=data,
+        headers=headers,
+        timeout=600,  # 10 min max
+    )
+    resp.raise_for_status()
+
+    output_path.write_bytes(resp.content)
+    log.info("Cloud Run returned %.1f MB encoded video", len(resp.content) / 1024 / 1024)
+    return output_path
 
 
 def upload_to_tiktok(video_path: Path, access_token: str, description: str = "") -> str:
