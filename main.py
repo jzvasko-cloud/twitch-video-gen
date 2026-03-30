@@ -1310,9 +1310,16 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
         },
         timeout=30,
     )
+    log.info("TikTok init response (%d): %s", init_resp.status_code, init_resp.text[:500])
     if init_resp.status_code != 200:
-        log.error("TikTok init failed (%d): %s", init_resp.status_code, init_resp.text[:500])
-        init_resp.raise_for_status()
+        # Extract TikTok's error details for better debugging
+        try:
+            err_data = init_resp.json().get("error", {})
+            err_code = err_data.get("code", "unknown")
+            err_msg = err_data.get("message", init_resp.text[:300])
+            raise ValueError(f"TikTok init failed ({init_resp.status_code}): {err_code} — {err_msg}")
+        except (ValueError, KeyError):
+            init_resp.raise_for_status()
     init_data = init_resp.json()
 
     if init_data.get("error", {}).get("code") != "ok":
