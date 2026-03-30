@@ -840,12 +840,12 @@ def _generate_ass_captions(boundaries: list, duration: float, ass_path: Path):
     header = """[Script Info]
 Title: ClipLoreTV Captions
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: 720
+PlayResY: 1280
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,80,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,5,30,30,150,1
+Style: Default,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,0,5,20,20,100,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1102,26 +1102,26 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale clips to 1080x1920 (9:16) — use up to 8 clips at ~5-7s each
-    # for faster cuts that keep viewer attention (research: 7-12 clips ideal)
+    # Scale clips to 720x1280 (9:16) — 720p keeps encoding fast on free tier
+    # TikTok/YouTube upscale to 1080p on their end
     max_clips = min(len(clip_paths), max(int(vo_duration / 5), 4))
     use_clips = clip_paths[:max_clips]
-    log.info("Scaling %d clips to 1080x1920 (~%.0fs each)", len(use_clips), vo_duration / len(use_clips))
+    log.info("Scaling %d clips to 720x1280 (~%.0fs each)", len(use_clips), vo_duration / len(use_clips))
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 0.5
 
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
-            vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1"
+            vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
 
             # Add hook text overlay on the first clip (first 3 seconds)
             if i == 0 and hook_text:
                 safe_hook = hook_text[:80].replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
                 vf += (
                     f",drawtext=text='{safe_hook}':"
-                    "fontsize=56:fontcolor=white:borderw=4:bordercolor=black:"
-                    "box=1:boxborderw=12:boxcolor=black@0.6:"
+                    "fontsize=36:fontcolor=white:borderw=3:bordercolor=black:"
+                    "box=1:boxborderw=8:boxcolor=black@0.6:"
                     "x=(w-text_w)/2:y=h*0.15:"
                     "enable='between(t,0,3)'"
                 )
@@ -1144,7 +1144,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 if i == 0:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", str(cp),
-                         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+                         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
                          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                          "-t", str(per_clip), str(sp)],
                         capture_output=True, timeout=180,
@@ -1222,7 +1222,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
              "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
              "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
              str(final)],
-            capture_output=True, timeout=480,
+            capture_output=True, timeout=300,
         )
         # If caption burn timed out or failed, fall back to no-caption merge
         if not final.exists() or final.stat().st_size < 10000:
