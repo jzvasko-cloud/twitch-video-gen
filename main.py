@@ -945,64 +945,51 @@ def _build_drawtext_chain(chunks: list) -> str:
     return ",".join(parts)
 
 
-# Background music: try Pixabay free audio first, fall back to FFmpeg synth
+# Background music: Freesound API for real beats, FFmpeg synth as fallback
 _BG_MUSIC_CACHE = TEMP_DIR / "bg_music.mp3"
 _BG_MUSIC_SYNTH = TEMP_DIR / "bg_phonk_synth.mp3"
-PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY", "")
 
 
-def _fetch_pixabay_music(duration: float) -> Path | None:
-    """Try to download a royalty-free beat from Pixabay Audio API."""
-    if not PIXABAY_API_KEY:
+def _fetch_freesound_music(duration: float) -> Path | None:
+    """Download a royalty-free beat from Freesound.org API (CC0 license)."""
+    if not FREESOUND_API_KEY:
         return None
     try:
-        # Search for short gaming/phonk beats
-        resp = requests.get(
-            "https://pixabay.com/api/",
-            params={
-                "key": PIXABAY_API_KEY,
-                "q": "phonk beat dark",
-                "category": "music",
-                "per_page": 5,
-                "safesearch": "true",
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        hits = resp.json().get("hits", [])
-        if not hits:
-            # Broaden search
+        # Search for short beats with permissive license
+        for query in ["phonk beat", "hip hop beat instrumental", "dark trap beat", "lo-fi beat"]:
             resp = requests.get(
-                "https://pixabay.com/api/",
+                "https://freesound.org/apiv2/search/text/",
                 params={
-                    "key": PIXABAY_API_KEY,
-                    "q": "gaming hip hop beat",
-                    "category": "music",
-                    "per_page": 5,
-                    "safesearch": "true",
+                    "query": query,
+                    "filter": "duration:[10 TO 120] license:\"Creative Commons 0\"",
+                    "fields": "id,name,duration,previews",
+                    "page_size": 5,
+                    "token": FREESOUND_API_KEY,
                 },
                 timeout=10,
             )
             resp.raise_for_status()
-            hits = resp.json().get("hits", [])
-
-        if not hits:
+            results = resp.json().get("results", [])
+            if results:
+                break
+        else:
             return None
 
-        # Pick a random track from results
-        track = random.choice(hits)
-        audio_url = track.get("previewURL") or track.get("webformatURL")
-        if not audio_url:
+        track = random.choice(results)
+        # Freesound provides HQ mp3 and OGG previews
+        preview_url = track.get("previews", {}).get("preview-hq-mp3")
+        if not preview_url:
             return None
 
-        log.info("Downloading Pixabay track: %s", track.get("tags", "")[:60])
-        dl = requests.get(audio_url, timeout=30)
+        log.info("Downloading Freesound track: %s (%.0fs)", track.get("name", "")[:40], track.get("duration", 0))
+        dl = requests.get(preview_url, timeout=30)
         dl.raise_for_status()
         _BG_MUSIC_CACHE.write_bytes(dl.content)
         if _BG_MUSIC_CACHE.stat().st_size > 5000:
             return _BG_MUSIC_CACHE
     except Exception as exc:
-        log.warning("Pixabay music fetch failed: %s", exc)
+        log.warning("Freesound music fetch failed: %s", exc)
     return None
 
 
@@ -1037,14 +1024,14 @@ def _generate_synth_beat(duration: float) -> Path | None:
 
 
 def _get_bg_music(duration: float = 120) -> Path | None:
-    """Get background music: Pixabay first, then synth fallback."""
+    """Get background music: Freesound first, then synth fallback."""
     # Use cached file if fresh (less than 24 hours old)
     if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 5000:
         age = time.time() - _BG_MUSIC_CACHE.stat().st_mtime
         if age < 86400:
             return _BG_MUSIC_CACHE
 
-    music = _fetch_pixabay_music(duration)
+    music = _fetch_freesound_music(duration)
     if music:
         return music
 
