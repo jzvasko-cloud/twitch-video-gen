@@ -62,8 +62,8 @@ PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-d6ich8haae7s73ce1i70")
-ENCODER_URL = os.environ.get("ENCODER_URL", "")  # Cloud Run encoder service URL
-ENCODER_SECRET = os.environ.get("ENCODER_SECRET", "")  # API key for encoder service
+ENCODER_URL = os.environ.get("ENCODER_URL", "https://cliplore-encoder-347562229502.us-central1.run.app")
+ENCODER_SECRET = os.environ.get("ENCODER_SECRET", API_SECRET)  # defaults to same key as main service
 
 # Fail fast: require API secret in production to prevent open endpoints
 if not API_SECRET and os.environ.get("RENDER"):
