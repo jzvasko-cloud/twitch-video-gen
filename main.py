@@ -1173,16 +1173,10 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # Generate ASS captions from TTS word boundaries (if available)
-    ass_path = job_dir / "captions.ass"
+    # Caption burn disabled — ASS subtitle re-encode exceeds Render free tier
+    # CPU limits even at 720p. TikTok/YouTube auto-generate captions from the
+    # voiceover audio. YouTube also gets SRT captions uploaded separately.
     has_captions = False
-    if boundaries:
-        try:
-            _generate_ass_captions(boundaries, vo_duration, ass_path)
-            has_captions = ass_path.exists() and ass_path.stat().st_size > 100
-            log.info("ASS captions generated: %s", has_captions)
-        except Exception as exc:
-            log.warning("ASS caption generation failed: %s", exc)
 
     # Mix voiceover with background music
     bg_music = _get_bg_music(duration=vo_duration + 5)
