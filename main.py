@@ -672,19 +672,29 @@ def _get_clip_source_url(slug: str) -> str:
 def _extract_clip_sources(topic: str) -> dict:
     """Ask AI to extract relevant streamer names and game names from a topic.
 
-    Returns {"streamers": [...], "games": [...]} or empty dict on failure.
+    Returns {"streamers": [...], "related": [...], "games": [...]} or empty dict on failure.
     """
     prompt = (
         f"Given this video topic about Twitch/gaming: \"{topic}\"\n\n"
         "Return a JSON object with:\n"
         '- "streamers": list of 2-4 Twitch login usernames (lowercase, no spaces) '
-        "that are directly mentioned or most relevant to this topic\n"
-        '- "games": list of 1-2 exact Twitch game/category names relevant to the clips '
-        "that would look good as background footage\n\n"
+        "that are DIRECTLY mentioned in the topic. These must be the main subjects.\n"
+        '- "related": list of 3-5 Twitch login usernames (lowercase, no spaces) '
+        "of streamers who are closely related to the topic, were part of the same "
+        "events, or are in the same scene. These are used as BACKUP clip sources "
+        "when the main streamers have no clips available. Pick streamers who would "
+        "make visually relevant background footage for this topic.\n"
+        '- "games": list of 1-3 exact Twitch game/category names relevant to the clips '
+        "that would look good as background footage. Include 'Just Chatting' if the "
+        "topic is about streamer drama or opinions.\n\n"
+        "IMPORTANT: For streamers who may no longer be on Twitch (banned, moved platforms), "
+        "still include them in 'streamers' but make sure 'related' has active Twitch "
+        "streamers who were part of the same story.\n\n"
         "Examples:\n"
-        '- "xQc vs Hasan debate" → {"streamers": ["xqc", "hasanabi"], "games": ["Just Chatting"]}\n'
-        '- "Fortnite is dying" → {"streamers": ["ninja", "tfue", "clix"], "games": ["Fortnite"]}\n'
-        '- "Top Valorant plays" → {"streamers": ["tarik", "tenz"], "games": ["VALORANT"]}\n\n'
+        '- "xQc vs Hasan debate" → {"streamers": ["xqc", "hasanabi"], "related": ["destiny", "mizkif", "ludwig"], "games": ["Just Chatting"]}\n'
+        '- "Ninja failed on Mixer" → {"streamers": ["ninja"], "related": ["shroud", "timthetatman", "drlupo", "couragejd"], "games": ["Fortnite", "Just Chatting"]}\n'
+        '- "Top Valorant plays" → {"streamers": ["tarik", "tenz"], "related": ["shroud", "sinatraa", "kyedae"], "games": ["VALORANT"]}\n'
+        '- "DrDisrespect ban" → {"streamers": ["drdisrespect"], "related": ["timthetatman", "nickmercs", "shroud", "summit1g"], "games": ["Just Chatting", "Call of Duty: Warzone"]}\n\n'
         "Return ONLY valid JSON, nothing else."
     )
     try:
@@ -697,9 +707,10 @@ def _extract_clip_sources(topic: str) -> dict:
                 raw = raw[4:]
         data = json.loads(raw)
         streamers = [s.lower().strip() for s in data.get("streamers", []) if isinstance(s, str)]
+        related = [s.lower().strip() for s in data.get("related", []) if isinstance(s, str)]
         games = [g.strip() for g in data.get("games", []) if isinstance(g, str)]
-        log.info("AI extracted sources — streamers: %s, games: %s", streamers, games)
-        return {"streamers": streamers[:4], "games": games[:2]}
+        log.info("AI extracted sources — streamers: %s, related: %s, games: %s", streamers, related, games)
+        return {"streamers": streamers[:4], "related": related[:5], "games": games[:3]}
     except Exception as exc:
         log.warning("Failed to extract clip sources from topic: %s", exc)
         # Fallback: try to find streamer names mentioned in the topic
@@ -2479,17 +2490,24 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     # Step 2: Fetch clips — smart sourcing based on topic
     clip_urls = []
     try:
-        # First: ask AI for relevant streamers/games
+        # First: ask AI for relevant streamers/games/related
         sources = _extract_clip_sources(topic)
         ai_streamers = sources.get("streamers", [])
+        ai_related = sources.get("related", [])
         ai_games = sources.get("games", [])
 
-        # Try AI-suggested streamers
+        # Try primary streamers first (the ones directly mentioned in the topic)
         if ai_streamers:
             clip_urls = fetch_clip_urls(ai_streamers, count=3)
-            log.info("Got %d clips from AI-suggested streamers %s", len(clip_urls), ai_streamers)
+            log.info("Got %d clips from primary streamers %s", len(clip_urls), ai_streamers)
 
-        # If not enough, try game-based clips
+        # If not enough, try related streamers (same scene/event, still relevant)
+        if len(clip_urls) < 4 and ai_related:
+            related_clips = fetch_clip_urls(ai_related, count=3)
+            clip_urls.extend(related_clips)
+            log.info("Got %d clips from related streamers %s", len(related_clips), ai_related)
+
+        # If still not enough, try game-based clips (visually relevant)
         if len(clip_urls) < 4 and ai_games:
             for game in ai_games:
                 game_clips = _fetch_clips_by_game(game, count=5)
