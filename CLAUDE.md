@@ -41,6 +41,11 @@ Core logic extracted into reusable functions:
 - [x] Code deployed and running on Render
 - [x] All env vars configured
 - [x] Code cleaned up — no more duplicated pipeline logic
+- [x] Token persistence — encrypted with Fernet, persisted to Render env vars via API
+- [x] Neural TTS — edge-tts (Microsoft AndrewMultilingual), gTTS as fallback only
+- [x] Async processing — /pipeline, /assemble-video, /cron all run in background threads, return 202, poll via /job/<job_id>
+- [x] Multi-platform uploads — TikTok, YouTube Shorts, Instagram Reels
+- [x] Smart clip sourcing — AI extracts relevant streamers/games from topic
 - [ ] TikTok OAuth — needs redirect URI + scopes verified in TikTok Developer Portal
 - [ ] External cron service — needs setup (cron-job.org or similar)
 - [ ] End-to-end pipeline test once TikTok auth is resolved

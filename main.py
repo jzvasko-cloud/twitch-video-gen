@@ -243,6 +243,39 @@ def _pop_oauth_state(platform: str) -> dict | None:
 _tmp_video_tokens: dict = {}  # {token: (file_path, expires_at)}
 
 # ---------------------------------------------------------------------------
+# Async job tracker — lets /pipeline and /assemble-video return 202 immediately
+# ---------------------------------------------------------------------------
+_jobs: dict = {}  # {job_id: {"status": str, "result": dict|None, "error": str|None, "created": float}}
+_JOBS_MAX = 50  # max jobs to keep in memory
+_JOBS_TTL = 3600  # auto-expire after 1 hour
+
+
+def _create_job() -> str:
+    """Create a new job entry and return its ID."""
+    job_id = uuid.uuid4().hex[:12]
+    # Evict oldest jobs if at capacity
+    if len(_jobs) >= _JOBS_MAX:
+        oldest = sorted(_jobs, key=lambda k: _jobs[k]["created"])
+        for old_id in oldest[:len(_jobs) - _JOBS_MAX + 1]:
+            _jobs.pop(old_id, None)
+    _jobs[job_id] = {"status": "running", "result": None, "error": None, "created": time.time()}
+    return job_id
+
+
+def _complete_job(job_id: str, result: dict):
+    """Mark a job as completed with its result."""
+    if job_id in _jobs:
+        _jobs[job_id]["status"] = "completed"
+        _jobs[job_id]["result"] = result
+
+
+def _fail_job(job_id: str, error: str):
+    """Mark a job as failed with an error message."""
+    if job_id in _jobs:
+        _jobs[job_id]["status"] = "failed"
+        _jobs[job_id]["error"] = error
+
+# ---------------------------------------------------------------------------
 # Security helpers
 # ---------------------------------------------------------------------------
 _rate_store: dict = {}
@@ -807,12 +840,12 @@ def _generate_ass_captions(boundaries: list, duration: float, ass_path: Path):
     header = """[Script Info]
 Title: ClipLoreTV Captions
 ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
+PlayResX: 1080
+PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,62,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,5,0,5,20,20,100,1
+Style: Default,Arial,80,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,0,5,30,30,150,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -912,52 +945,110 @@ def _build_drawtext_chain(chunks: list) -> str:
     return ",".join(parts)
 
 
-# Background music: phonk-style bass beat generated with FFmpeg
-_BG_MUSIC_CACHE = TEMP_DIR / "bg_phonk.mp3"
+# Background music: try Pixabay free audio first, fall back to FFmpeg synth
+_BG_MUSIC_CACHE = TEMP_DIR / "bg_music.mp3"
+_BG_MUSIC_SYNTH = TEMP_DIR / "bg_phonk_synth.mp3"
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
 
 
-def _get_bg_music(duration: float = 120) -> Path | None:
-    """Generate a phonk-style bass beat using FFmpeg synthesis.
-
-    Creates a deep 808-style sub-bass pulse at ~140 BPM with a higher
-    percussion click layered on top — the core phonk aesthetic.
-    """
-    if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 5000:
-        return _BG_MUSIC_CACHE
+def _fetch_pixabay_music(duration: float) -> Path | None:
+    """Try to download a royalty-free beat from Pixabay Audio API."""
+    if not PIXABAY_API_KEY:
+        return None
     try:
-        # 140 BPM = pulse every 0.4286s
-        # Bass: 55Hz sine pulsed at 140 BPM with fast decay
-        # Hi-hat: 8000Hz noise burst on every other beat
+        # Search for short gaming/phonk beats
+        resp = requests.get(
+            "https://pixabay.com/api/",
+            params={
+                "key": PIXABAY_API_KEY,
+                "q": "phonk beat dark",
+                "category": "music",
+                "per_page": 5,
+                "safesearch": "true",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        hits = resp.json().get("hits", [])
+        if not hits:
+            # Broaden search
+            resp = requests.get(
+                "https://pixabay.com/api/",
+                params={
+                    "key": PIXABAY_API_KEY,
+                    "q": "gaming hip hop beat",
+                    "category": "music",
+                    "per_page": 5,
+                    "safesearch": "true",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            hits = resp.json().get("hits", [])
+
+        if not hits:
+            return None
+
+        # Pick a random track from results
+        track = random.choice(hits)
+        audio_url = track.get("previewURL") or track.get("webformatURL")
+        if not audio_url:
+            return None
+
+        log.info("Downloading Pixabay track: %s", track.get("tags", "")[:60])
+        dl = requests.get(audio_url, timeout=30)
+        dl.raise_for_status()
+        _BG_MUSIC_CACHE.write_bytes(dl.content)
+        if _BG_MUSIC_CACHE.stat().st_size > 5000:
+            return _BG_MUSIC_CACHE
+    except Exception as exc:
+        log.warning("Pixabay music fetch failed: %s", exc)
+    return None
+
+
+def _generate_synth_beat(duration: float) -> Path | None:
+    """Generate a phonk-style bass beat using FFmpeg synthesis (fallback)."""
+    if _BG_MUSIC_SYNTH.exists() and _BG_MUSIC_SYNTH.stat().st_size > 5000:
+        return _BG_MUSIC_SYNTH
+    try:
         subprocess.run(
             [
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i",
-                f"sine=frequency=55:duration={duration}",
-                "-f", "lavfi", "-i",
-                f"sine=frequency=110:duration={duration}",
-                "-f", "lavfi", "-i",
-                f"anoisesrc=d={duration}:c=pink:a=0.03",
+                "-f", "lavfi", "-i", f"sine=frequency=55:duration={duration}",
+                "-f", "lavfi", "-i", f"sine=frequency=110:duration={duration}",
+                "-f", "lavfi", "-i", f"anoisesrc=d={duration}:c=pink:a=0.03",
                 "-filter_complex",
-                # Pulse the bass at ~140 BPM with tremolo
                 "[0:a]volume=0.06,tremolo=f=5.6:d=0.8[bass];"
-                # Sub-harmonic for that 808 weight
                 "[1:a]volume=0.03,tremolo=f=2.8:d=0.6[sub];"
-                # Pink noise as hi-hat texture
                 "[2:a]highpass=f=6000,lowpass=f=12000,tremolo=f=11.2:d=0.9[hat];"
-                # Mix and shape
                 "[bass][sub][hat]amix=inputs=3:duration=longest,"
                 "lowpass=f=15000,compand=attacks=0.01:decays=0.1:points=-80/-80|-20/-10|0/-3",
                 "-c:a", "libmp3lame", "-b:a", "96k",
-                str(_BG_MUSIC_CACHE),
+                str(_BG_MUSIC_SYNTH),
             ],
             capture_output=True, timeout=30,
         )
-        if _BG_MUSIC_CACHE.exists():
-            log.info("Generated phonk background beat (%.0fs)", duration)
-            return _BG_MUSIC_CACHE
+        if _BG_MUSIC_SYNTH.exists():
+            log.info("Generated synth phonk beat (%.0fs)", duration)
+            return _BG_MUSIC_SYNTH
     except Exception as exc:
-        log.warning("Failed to generate background music: %s", exc)
+        log.warning("Synth beat generation failed: %s", exc)
     return None
+
+
+def _get_bg_music(duration: float = 120) -> Path | None:
+    """Get background music: Pixabay first, then synth fallback."""
+    # Use cached file if fresh (less than 24 hours old)
+    if _BG_MUSIC_CACHE.exists() and _BG_MUSIC_CACHE.stat().st_size > 5000:
+        age = time.time() - _BG_MUSIC_CACHE.stat().st_mtime
+        if age < 86400:
+            return _BG_MUSIC_CACHE
+
+    music = _fetch_pixabay_music(duration)
+    if music:
+        return music
+
+    return _generate_synth_beat(duration)
 
 
 def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = "", hook_text: str = "") -> tuple:
@@ -1024,22 +1115,29 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     if not clip_paths:
         raise ValueError("Could not download any clips (Twitch + Pexels both failed)")
 
-    # Scale clips to 720x1280 (9:16) — use up to 8 clips at ~5-7s each
+    # Scale clips to 1080x1920 (9:16) — use up to 8 clips at ~5-7s each
     # for faster cuts that keep viewer attention (research: 7-12 clips ideal)
     max_clips = min(len(clip_paths), max(int(vo_duration / 5), 4))
     use_clips = clip_paths[:max_clips]
-    log.info("Scaling %d clips to 720x1280 (~%.0fs each)", len(use_clips), vo_duration / len(use_clips))
+    log.info("Scaling %d clips to 1080x1920 (~%.0fs each)", len(use_clips), vo_duration / len(use_clips))
     scaled = []
     per_clip = vo_duration / max(len(use_clips), 1) + 0.5
-
-    # NOTE: drawtext filters cause encoding timeouts on Render free tier
-    # even for a single clip. Text overlays are not feasible. The narration
-    # hook + YouTube title serve as the hook instead.
 
     for i, cp in enumerate(use_clips):
         sp = job_dir / f"scaled_{i}.mp4"
         try:
-            vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
+            vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1"
+
+            # Add hook text overlay on the first clip (first 3 seconds)
+            if i == 0 and hook_text:
+                safe_hook = hook_text[:80].replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
+                vf += (
+                    f",drawtext=text='{safe_hook}':"
+                    "fontsize=56:fontcolor=white:borderw=4:bordercolor=black:"
+                    "box=1:boxborderw=12:boxcolor=black@0.6:"
+                    "x=(w-text_w)/2:y=h*0.15:"
+                    "enable='between(t,0,3)'"
+                )
 
             result = subprocess.run(
                 [
@@ -1059,7 +1157,7 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
                 if i == 0:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", str(cp),
-                         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+                         "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
                          "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
                          "-t", str(per_clip), str(sp)],
                         capture_output=True, timeout=180,
@@ -1088,9 +1186,16 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         capture_output=True, timeout=120,
     )
 
-    # NOTE: Caption burn (ASS subtitle filter) requires full video re-encode
-    # which exceeds Render free tier CPU limits (~10+ min for 60s video).
-    # YouTube auto-generates captions from the voiceover audio instead.
+    # Generate ASS captions from TTS word boundaries (if available)
+    ass_path = job_dir / "captions.ass"
+    has_captions = False
+    if boundaries:
+        try:
+            _generate_ass_captions(boundaries, vo_duration, ass_path)
+            has_captions = ass_path.exists() and ass_path.stat().st_size > 100
+            log.info("ASS captions generated: %s", has_captions)
+        except Exception as exc:
+            log.warning("ASS caption generation failed: %s", exc)
 
     # Mix voiceover with background music
     bg_music = _get_bg_music(duration=vo_duration + 5)
@@ -1114,17 +1219,37 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
     else:
         mixed_audio = tts_path
 
-    # Final merge: video + mixed audio (copy video stream for speed)
-    log.info("Final merge (vo=%.1fs, %d clips, music=%s)",
-             vo_duration, len(scaled), bg_music is not None)
+    # Final merge: video + mixed audio + captions (single re-encode pass)
+    # Burning ASS subs here is efficient because we process the concat once,
+    # not per-clip. Uses ultrafast preset to stay within Render free tier limits.
+    log.info("Final merge (vo=%.1fs, %d clips, music=%s, captions=%s)",
+             vo_duration, len(scaled), bg_music is not None, has_captions)
     final = job_dir / "final.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
-         "-c:v", "copy",
-         "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
-         str(final)],
-        capture_output=True, timeout=120,
-    )
+
+    if has_captions:
+        # Re-encode video to burn in subtitles — single pass on the concatenated video
+        ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
+             "-vf", f"ass='{ass_escaped}'",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+             str(final)],
+            capture_output=True, timeout=300,
+        )
+        # If caption burn timed out or failed, fall back to no-caption merge
+        if not final.exists() or final.stat().st_size < 10000:
+            log.warning("Caption burn failed, falling back to copy merge")
+            has_captions = False
+
+    if not has_captions:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(concat_vid), "-i", str(mixed_audio),
+             "-c:v", "copy",
+             "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart",
+             str(final)],
+            capture_output=True, timeout=120,
+        )
 
     if not final.exists():
         raise ValueError("Final video assembly failed")
@@ -2083,6 +2208,30 @@ def _create_tmp_video_url(video_path: Path, ttl: int = 600) -> str:
 
 
 # ===================================================================
+#  Async job status endpoint
+# ===================================================================
+@app.route("/job/<job_id>")
+def job_status(job_id):
+    """Check the status of an async job. Returns status, result (if done), or error (if failed)."""
+    # Clean up expired jobs on access
+    now = time.time()
+    expired = [k for k, v in _jobs.items() if now - v["created"] > _JOBS_TTL]
+    for k in expired:
+        _jobs.pop(k, None)
+
+    job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found or expired"}), 404
+
+    resp = {"job_id": job_id, "status": job["status"]}
+    if job["status"] == "completed":
+        resp["result"] = job["result"]
+    elif job["status"] == "failed":
+        resp["error"] = job["error"]
+    return jsonify(resp)
+
+
+# ===================================================================
 #  API endpoints
 # ===================================================================
 @app.route("/generate-script", methods=["POST"])
@@ -2177,15 +2326,22 @@ def assemble_video_endpoint():
         if not isinstance(url, str) or not url.startswith("https://"):
             return jsonify({"error": "All clip_urls must be HTTPS URLs"}), 400
 
-    try:
-        video_path, duration, _ = assemble_video_from_parts(script, clip_urls)
-        return jsonify({
-            "video_path": str(video_path),
-            "job_id": video_path.parent.name,
-            "duration": duration,
-        })
-    except Exception as e:
-        return jsonify({"error": f"Assembly failed: {_sanitize(str(e))}"}), 500
+    job_id = _create_job()
+
+    def _bg():
+        try:
+            with app.app_context():
+                video_path, duration, _ = assemble_video_from_parts(script, clip_urls)
+                _complete_job(job_id, {
+                    "video_path": str(video_path),
+                    "duration": duration,
+                })
+        except Exception as e:
+            log.error("Async assemble-video failed: %s", e, exc_info=True)
+            _fail_job(job_id, f"Assembly failed: {_sanitize(str(e))}")
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "accepted", "poll": f"/job/{job_id}"}), 202
 
 
 @app.route("/post-to-tiktok", methods=["POST"])
@@ -2232,7 +2388,21 @@ def pipeline():
     if not topic or not streamers:
         return jsonify({"error": "topic and streamers are required"}), 400
 
-    return _run_pipeline(topic, pillar, streamers, tiktok_token, description)
+    job_id = _create_job()
+
+    def _bg():
+        try:
+            with app.app_context():
+                result = _run_pipeline(topic, pillar, streamers, tiktok_token, description, _return_dict=True)
+                _complete_job(job_id, result)
+        except Exception as exc:
+            log.error("Async pipeline failed: %s", exc, exc_info=True)
+            _fail_job(job_id, f"Pipeline failed: {_sanitize(str(exc))}")
+            _send_notification("Pipeline Crashed", str(exc)[:500], success=False,
+                               details={"topic": topic, "pillar": pillar})
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "accepted", "topic": topic, "poll": f"/job/{job_id}"}), 202
 
 
 @app.route("/cron", methods=["POST"])
@@ -2268,9 +2438,19 @@ def cron():
     return jsonify({"status": "accepted", "topic": topic, "pillar": pillar}), 202
 
 
-def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_upload=False):
-    """Shared pipeline logic for /pipeline and /cron."""
+def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_upload=False, _return_dict=False):
+    """Shared pipeline logic for /pipeline and /cron.
+
+    When _return_dict=True, returns a plain dict (for async callers).
+    Otherwise returns a Flask jsonify response (legacy behavior for /cron).
+    """
     results = {"topic": topic, "pillar": pillar, "streamers": streamers, "steps": {}}
+
+    def _err_response(err_msg, code=500):
+        results["error"] = err_msg
+        if _return_dict:
+            raise RuntimeError(err_msg)
+        return jsonify({"error": err_msg, "steps": results["steps"]}), code
 
     # Step 1: Generate script
     try:
@@ -2279,7 +2459,7 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     except Exception as e:
         err = f"Script generation failed: {_sanitize(str(e))}"
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
-        return jsonify({"error": err, "steps": results["steps"]}), 500
+        return _err_response(err)
 
     # Step 2: Fetch clips — smart sourcing based on topic
     clip_urls = []
@@ -2314,11 +2494,11 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     except Exception as e:
         err = f"Clip fetch failed: {_sanitize(str(e))}"
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
-        return jsonify({"error": err, "steps": results["steps"]}), 500
+        return _err_response(err)
 
     if not clip_urls:
         _send_notification("❌ Pipeline Failed", "No clips found", success=False, details={"topic": topic})
-        return jsonify({"error": "No clips found", "steps": results["steps"]}), 400
+        return _err_response("No clips found", 400)
 
     # Extract first sentence from script as hook text for video overlay
     cleaned = clean_script(script_text)
@@ -2332,7 +2512,7 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     except Exception as e:
         err = f"Assembly failed: {_sanitize(str(e))}"
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
-        return jsonify({"error": err, "steps": results["steps"]}), 500
+        return _err_response(err)
 
     # Step 4: Post to platforms (each independent — one failure doesn't block others)
     all_ok = True
@@ -2347,6 +2527,8 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
         _last_pipeline_result["result"] = results
         _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _send_notification("🧪 Test Pipeline Complete", f"Video ready (no upload)\n{topic[:60]}", success=True, details=results)
+        if _return_dict:
+            return results
         return jsonify(results), 200
 
     # 4a: TikTok
@@ -2409,6 +2591,8 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     else:
         _send_notification("⚠️ Pipeline Partial Failure", topic[:200], success=False, details=platforms)
 
+    if _return_dict:
+        return results
     return jsonify(results)
 
 
