@@ -1287,32 +1287,43 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
     if file_size > 50 * 1024 * 1024:
         raise ValueError("Video too large (max 50 MB)")
 
-    init_resp = requests.post(
+    # Try direct publish first, fall back to inbox/draft if 403 (unaudited app)
+    for endpoint in [
         "https://open.tiktokapis.com/v2/post/publish/video/init/",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        },
-        json={
-            "post_info": {
-                "title": (description[:150]) if description else "ClipLoreTV",
-                "privacy_level": "SELF_ONLY",
-                "disable_duet": False,
-                "disable_comment": False,
-                "disable_stitch": False,
+        "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+    ]:
+        init_resp = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
             },
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": file_size,
-                "chunk_size": file_size,
-                "total_chunk_count": 1,
+            json={
+                "post_info": {
+                    "title": (description[:150]) if description else "ClipLoreTV",
+                    "privacy_level": "SELF_ONLY",
+                    "disable_duet": False,
+                    "disable_comment": False,
+                    "disable_stitch": False,
+                },
+                "source_info": {
+                    "source": "FILE_UPLOAD",
+                    "video_size": file_size,
+                    "chunk_size": file_size,
+                    "total_chunk_count": 1,
+                },
             },
-        },
-        timeout=30,
-    )
-    log.info("TikTok init response (%d): %s", init_resp.status_code, init_resp.text[:500])
+            timeout=30,
+        )
+        log.info("TikTok init (%s) response (%d): %s",
+                 endpoint.split("/")[-3], init_resp.status_code, init_resp.text[:500])
+
+        if init_resp.status_code == 403 and "inbox" not in endpoint:
+            log.warning("Direct publish returned 403, trying inbox/draft endpoint")
+            continue
+        break
+
     if init_resp.status_code != 200:
-        # Extract TikTok's error details for better debugging
         try:
             err_data = init_resp.json().get("error", {})
             err_code = err_data.get("code", "unknown")
