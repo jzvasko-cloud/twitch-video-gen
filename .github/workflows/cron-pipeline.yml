@@ -2,8 +2,12 @@ name: Run ClipLoreTV Pipeline (Cron)
 
 on:
   schedule:
-    # Every 12 hours: midnight and noon UTC
-    - cron: '0 0,12 * * *'
+    # 4x/day optimized for US gaming audiences:
+    #   3:00 UTC = 11 PM ET (late night gaming)
+    #  14:00 UTC = 10 AM ET (morning scroll)
+    #  18:00 UTC =  2 PM ET (afternoon break)
+    #  23:00 UTC =  7 PM ET (prime time gaming)
+    - cron: '0 3,14,18,23 * * *'
   workflow_dispatch:  # Allow manual trigger from GitHub UI
 
 jobs:

@@ -30,6 +30,12 @@ from flask import Flask, request, jsonify, redirect, abort, send_file
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from datetime import datetime, timedelta, timezone
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
 
 app = Flask(__name__)
 
@@ -64,6 +70,10 @@ RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-d6ich8haae7s73ce1i70")
 ENCODER_URL = os.environ.get("ENCODER_URL", "https://cliplore-encoder-347562229502.us-central1.run.app")
 ENCODER_SECRET = os.environ.get("ENCODER_SECRET", API_SECRET)  # defaults to same key as main service
+
+# Feature flags
+KICK_ENABLED = True
+REDDIT_TRENDING_ENABLED = True
 
 # Fail fast: require API secret in production to prevent open endpoints
 if not API_SECRET and os.environ.get("RENDER"):
@@ -591,9 +601,21 @@ def _call_claude(user_msg: str) -> str | None:
     return None
 
 
-def generate_script_text(topic: str, pillar: str = "") -> str:
-    """Generate a TikTok script, retrying if too short (< 100 words)."""
+def generate_script_text(topic: str, pillar: str = "", top_topics: list[str] | None = None) -> str:
+    """Generate a TikTok script, retrying if too short (< 100 words).
+
+    If top_topics is provided (from YouTube analytics), they are injected into
+    the prompt as context to steer content toward proven performers.
+    """
     base_msg = PILLAR_PREFIXES.get(pillar, "") + topic
+
+    # UPGRADE 3: Inject analytics context if available
+    if top_topics:
+        topics_str = "\n".join(f"  - {t}" for t in top_topics)
+        base_msg += (
+            f"\n\nThese topics performed best on our channel recently:\n{topics_str}\n"
+            "Generate content in a similar style or on related topics when relevant."
+        )
 
     for attempt in range(MAX_SCRIPT_RETRIES):
         # Add length enforcement on retries
@@ -932,8 +954,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             # ASS time format: H:MM:SS.cc
             s_str = f"{int(cs//3600)}:{int((cs%3600)//60):02d}:{int(cs%60):02d}.{int((cs%1)*100):02d}"
             e_str = f"{int(ce//3600)}:{int((ce%3600)//60):02d}:{int(ce%60):02d}.{int((ce%1)*100):02d}"
-            text_upper = chunk.upper().replace("\\", "\\\\")
-            events.append(f"Dialogue: 0,{s_str},{e_str},Default,,0,0,0,,{text_upper}")
+
+            # Karaoke-style: show full sentence, highlight active chunk yellow + 120%
+            parts = []
+            for j, c in enumerate(chunks):
+                c_upper = c.upper().replace("\\", "\\\\")
+                if j == i:
+                    # Active chunk: yellow (&H00FFFF& in ASS BGR), scaled 120%
+                    parts.append(
+                        f"{{\\1c&H00FFFF&\\fscx120\\fscy120}}{c_upper}"
+                        f"{{\\fscx100\\fscy100\\1c&H00FFFFFF&}}"
+                    )
+                else:
+                    # Inactive chunk: white at normal size
+                    parts.append(f"{{\\1c&H00FFFFFF&}}{c_upper}")
+            text_line = " ".join(parts)
+            events.append(f"Dialogue: 0,{s_str},{e_str},Default,,0,0,0,,{text_line}")
 
     ass_path.write_text(header + "\n".join(events), encoding="utf-8")
     log.info("Generated ASS captions with %d chunks for %.1fs", len(events), duration)
@@ -1450,6 +1486,230 @@ def _get_youtube_credentials():
     return creds
 
 
+# ---------------------------------------------------------------------------
+# UPGRADE 3: YouTube Analytics Feedback Loop
+# ---------------------------------------------------------------------------
+def get_top_performing_topics() -> list[str]:
+    """Fetch titles of top 5 performing videos from the last 30 days.
+
+    Uses the YouTube Data API (channels + playlistItems + videos endpoints) to
+    find the channel's recent uploads sorted by view count. Returns a list of
+    title strings. Costs ~7 quota units per call (negligible vs 10,000/day).
+    Fails gracefully — returns empty list on any error.
+    """
+    try:
+        creds = _get_youtube_credentials()
+        if not creds:
+            log.info("YouTube analytics skipped: no credentials")
+            return []
+
+        youtube = build("youtube", "v3", credentials=creds)
+
+        # Get the channel's uploads playlist ID
+        channels_resp = youtube.channels().list(
+            part="contentDetails", mine=True
+        ).execute()
+        if not channels_resp.get("items"):
+            log.warning("YouTube analytics: no channel found for authenticated user")
+            return []
+        uploads_playlist_id = channels_resp["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+
+        # Fetch recent uploads (last 50 — we filter by date client-side)
+        playlist_resp = youtube.playlistItems().list(
+            part="contentDetails",
+            playlistId=uploads_playlist_id,
+            maxResults=50,
+        ).execute()
+
+        video_ids = [item["contentDetails"]["videoId"] for item in playlist_resp.get("items", [])]
+        if not video_ids:
+            log.info("YouTube analytics: no uploads found")
+            return []
+
+        # Fetch statistics + snippet for these videos
+        videos_resp = youtube.videos().list(
+            part="snippet,statistics",
+            id=",".join(video_ids),
+        ).execute()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        recent_videos = []
+        for v in videos_resp.get("items", []):
+            published = v["snippet"].get("publishedAt", "")
+            try:
+                pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                if pub_dt < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                continue
+
+            view_count = int(v["statistics"].get("viewCount", 0))
+            title = v["snippet"].get("title", "")
+            if title:
+                recent_videos.append((view_count, title))
+
+        # Sort by views descending, take top 5
+        recent_videos.sort(key=lambda x: x[0], reverse=True)
+        top_titles = [title for _, title in recent_videos[:5]]
+
+        if top_titles:
+            log.info("YouTube analytics: top %d performing titles fetched", len(top_titles))
+        else:
+            log.info("YouTube analytics: no videos in last 30 days")
+
+        return top_titles
+
+    except Exception as exc:
+        log.warning("YouTube analytics feedback loop failed (non-blocking): %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# UPGRADE 4: Auto-Generate Custom Thumbnails
+# ---------------------------------------------------------------------------
+def generate_thumbnail(video_path, hook_text: str) -> "Path | None":
+    """Generate a 1280x720 YouTube thumbnail with text overlay.
+
+    1. Extracts a high-action frame via FFmpeg scene detection
+    2. Overlays dark gradient + bold text using Pillow
+    Returns the thumbnail path, or None on failure.
+    """
+    if not HAS_PILLOW:
+        log.warning("Thumbnail generation skipped: Pillow not installed")
+        return None
+
+    video_path = Path(video_path)
+    thumb_dir = video_path.parent
+    frame_path = thumb_dir / "thumb_frame.jpg"
+    thumbnail_path = thumb_dir / "thumbnail.jpg"
+
+    try:
+        # Step 1: Extract a high-action frame using scene detection
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", "select=gt(scene\\,0.3)",
+            "-frames:v", "1", "-q:v", "2",
+            str(frame_path),
+        ]
+        subprocess.run(ffmpeg_cmd, capture_output=True, timeout=30)
+
+        # Fallback: grab frame at 2 seconds if scene detection found nothing
+        if not frame_path.exists() or frame_path.stat().st_size < 1000:
+            log.info("Thumbnail: scene detection found nothing, falling back to t=2s")
+            ffmpeg_fallback = [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-ss", "2", "-frames:v", "1", "-q:v", "2",
+                str(frame_path),
+            ]
+            subprocess.run(ffmpeg_fallback, capture_output=True, timeout=30)
+
+        if not frame_path.exists() or frame_path.stat().st_size < 1000:
+            log.warning("Thumbnail: could not extract any frame from video")
+            return None
+
+        # Step 2: Build thumbnail with Pillow
+        img = Image.open(frame_path)
+        img = img.resize((1280, 720), Image.LANCZOS)
+
+        # Dark gradient overlay on bottom 40%
+        overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
+        draw_overlay = ImageDraw.Draw(overlay)
+        gradient_start_y = int(720 * 0.6)
+        for y in range(gradient_start_y, 720):
+            alpha = int(220 * (y - gradient_start_y) / (720 - gradient_start_y))
+            draw_overlay.line([(0, y), (1280, y)], fill=(0, 0, 0, alpha))
+        img = img.convert("RGBA")
+        img = Image.alpha_composite(img, overlay)
+        img = img.convert("RGB")
+
+        # Load font — try several common bold fonts
+        font = None
+        font_size = 60
+        font_paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "C:/Windows/Fonts/impact.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ]
+        for fp in font_paths:
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except (OSError, IOError):
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+            font_size = 20
+
+        # Prepare hook text — wrap to 2-3 lines, uppercase for impact
+        draw = ImageDraw.Draw(img)
+        words = hook_text.upper().split()
+        lines = []
+        current_line = ""
+        max_width = 1160  # 1280 - 120px padding
+
+        for word in words:
+            test_line = f"{current_line} {word}".strip()
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            if bbox[2] - bbox[0] > max_width and current_line:
+                lines.append(current_line)
+                current_line = word
+                if len(lines) >= 3:
+                    break
+            else:
+                current_line = test_line
+        if current_line and len(lines) < 3:
+            lines.append(current_line)
+
+        # Draw text with black stroke for readability, positioned bottom-center
+        text_block = "\n".join(lines)
+        bbox = draw.multiline_textbbox((0, 0), text_block, font=font, spacing=8)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        text_x = (1280 - text_w) // 2
+        text_y = 720 - text_h - 40  # 40px from bottom
+
+        draw.multiline_text(
+            (text_x, text_y), text_block, font=font,
+            fill="white", stroke_width=3, stroke_fill="black",
+            spacing=8, align="center",
+        )
+
+        img.save(str(thumbnail_path), "JPEG", quality=92)
+        log.info("Thumbnail generated: %s (%d lines of text)", thumbnail_path, len(lines))
+
+        # Cleanup extracted frame
+        frame_path.unlink(missing_ok=True)
+        return thumbnail_path
+
+    except Exception as exc:
+        log.warning("Thumbnail generation failed (non-blocking): %s", exc)
+        for p in [frame_path, thumbnail_path]:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return None
+
+
+def _set_youtube_thumbnail(video_id: str, thumbnail_path: Path):
+    """Upload a custom thumbnail to an existing YouTube video. Best-effort."""
+    try:
+        creds = _get_youtube_credentials()
+        if not creds:
+            return
+        youtube = build("youtube", "v3", credentials=creds)
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=MediaFileUpload(str(thumbnail_path), mimetype="image/jpeg"),
+        ).execute()
+        log.info("Custom thumbnail set for YouTube video %s", video_id)
+    except Exception as exc:
+        log.warning("YouTube thumbnail upload failed (non-blocking): %s", exc)
+
+
 def upload_to_youtube(video_path: Path, title: str = "", description: str = "") -> str:
     """Upload video to YouTube Shorts. Returns video ID."""
     creds = _get_youtube_credentials()
@@ -1678,6 +1938,89 @@ def _get_tiktok_token():
         log.warning("TikTok token expired and refresh failed — returning None")
         return None
     return token
+
+
+# ---------------------------------------------------------------------------
+# Reddit Trending Topics
+# ---------------------------------------------------------------------------
+def get_trending_topics_reddit(min_score: int = 100) -> list:
+    """Fetch hot posts from r/LivestreamFail with 100+ upvotes.
+
+    Returns list of dicts: [{"title": str, "score": int, "url": str}, ...]
+    Uses Reddit's public JSON API -- no authentication required.
+    Fails gracefully: returns empty list on any error.
+    """
+    if not REDDIT_TRENDING_ENABLED:
+        return []
+    try:
+        resp = requests.get(
+            "https://www.reddit.com/r/LivestreamFail/hot.json?limit=25",
+            headers={"User-Agent": "ClipLoreTV/1.0 (automated content pipeline)"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        posts = data.get("data", {}).get("children", [])
+        trending = []
+        for post in posts:
+            pd = post.get("data", {})
+            score = pd.get("score", 0)
+            title = pd.get("title", "").strip()
+            url = pd.get("url", "")
+            if score >= min_score and title and not pd.get("stickied", False):
+                trending.append({"title": title, "score": score, "url": url})
+        trending.sort(key=lambda x: x["score"], reverse=True)
+        log.info("Reddit trending: found %d posts with %d+ upvotes", len(trending), min_score)
+        return trending
+    except Exception as exc:
+        log.warning("Reddit trending fetch failed (non-blocking): %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Kick.com Clip Sourcing
+# ---------------------------------------------------------------------------
+def fetch_kick_clips(streamer_name: str, count: int = 5) -> list:
+    """Fetch clips from Kick.com for a given streamer.
+
+    Returns list of clip download URLs (same format as Twitch clip fetcher).
+    Uses Kick's public API -- no authentication required.
+    Fails gracefully: returns empty list on any error.
+    """
+    if not KICK_ENABLED:
+        return []
+    try:
+        resp = requests.get(
+            f"https://kick.com/api/v2/channels/{streamer_name}/clips",
+            headers={"User-Agent": "ClipLoreTV/1.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        clips_data = data.get("clips", data) if isinstance(data, dict) else data
+        if isinstance(clips_data, dict):
+            clips_data = clips_data.get("data", [])
+        if not isinstance(clips_data, list):
+            log.warning("Kick API returned unexpected format for '%s'", streamer_name)
+            return []
+
+        # Sort by view count descending, take top N
+        clips_data.sort(key=lambda c: c.get("view_count", c.get("views", 0)), reverse=True)
+        urls = []
+        for clip in clips_data[:count]:
+            # Kick clips have various URL fields depending on API version
+            clip_url = (
+                clip.get("clip_url")
+                or clip.get("video_url")
+                or clip.get("thumbnail_url", "").replace("-preview.jpg", ".mp4")
+            )
+            if clip_url and clip_url.endswith(".mp4"):
+                urls.append(clip_url)
+        log.info("Kick clips for '%s': found %d usable clips", streamer_name, len(urls))
+        return urls
+    except Exception as exc:
+        log.warning("Kick clip fetch failed for '%s' (non-blocking): %s", streamer_name, exc)
+        return []
 
 
 # ===================================================================
@@ -2112,7 +2455,7 @@ def tiktok_status():
 # ===================================================================
 #  YouTube OAuth routes
 # ===================================================================
-YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
 
 
 @app.route("/youtube/auth")
@@ -2532,8 +2875,21 @@ def cron():
     description = data.get("description", "#twitch #gaming #streamer #cliploretv #shorts")
     test_only = data.get("test_only", False)
 
-    topic, pillar = _pick_topic()
-    log.info("CRON: topic=%s pillar=%s streamers=%s test_only=%s", topic[:50], pillar, streamers, test_only)
+    # Try Reddit trending first, fall back to topic bank
+    topic_source = "topic_bank"
+    trending = get_trending_topics_reddit()
+    if trending:
+        picked = trending[0]  # highest-scored post
+        topic = f"Create a video about this trending gaming topic: {picked['title']}"
+        pillar = "hot_take"
+        topic_source = "reddit"
+        log.info("CRON: using Reddit trending topic (score=%d): %s", picked["score"], picked["title"][:60])
+    else:
+        topic, pillar = _pick_topic()
+        log.info("CRON: Reddit unavailable or no trending posts, using topic bank")
+
+    log.info("CRON: source=%s topic=%s pillar=%s streamers=%s test_only=%s",
+             topic_source, topic[:50], pillar, streamers, test_only)
 
     def _bg():
         try:
@@ -2541,13 +2897,13 @@ def cron():
                 _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_upload=test_only)
         except Exception as exc:
             log.error("Background pipeline crashed: %s", exc, exc_info=True)
-            _send_notification("💥 Pipeline Crashed", str(exc)[:500], success=False,
-                               details={"topic": topic, "pillar": pillar})
+            _send_notification("Pipeline Crashed", str(exc)[:500], success=False,
+                               details={"topic": topic, "pillar": pillar, "topic_source": topic_source})
             _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             _last_pipeline_result["result"] = {"error": str(exc), "topic": topic}
 
     threading.Thread(target=_bg, daemon=True).start()
-    return jsonify({"status": "accepted", "topic": topic, "pillar": pillar}), 202
+    return jsonify({"status": "accepted", "topic": topic, "pillar": pillar, "topic_source": topic_source}), 202
 
 
 def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_upload=False, _return_dict=False):
@@ -2566,9 +2922,21 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
             raise RuntimeError(err_msg)
         return jsonify({"error": err_msg, "steps": results["steps"]}), code
 
+    # Step 0: YouTube analytics feedback loop (non-blocking)
+    top_topics = []
+    try:
+        top_topics = get_top_performing_topics()
+        if top_topics:
+            results["steps"]["analytics"] = {"status": "ok", "top_topics": top_topics}
+        else:
+            results["steps"]["analytics"] = {"status": "skipped", "reason": "no data"}
+    except Exception as e:
+        results["steps"]["analytics"] = {"status": "skipped", "reason": str(e)[:100]}
+        log.warning("Analytics feedback skipped: %s", e)
+
     # Step 1: Generate script
     try:
-        script_text = generate_script_text(topic, pillar)
+        script_text = generate_script_text(topic, pillar, top_topics=top_topics)
         results["steps"]["script"] = {"status": "ok", "word_count": len(script_text.split())}
     except Exception as e:
         err = f"Script generation failed: {_sanitize(str(e))}"
@@ -2604,6 +2972,21 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
                 if len(clip_urls) >= 8:
                     break
 
+        # Kick.com clip sourcing — merge with Twitch clips
+        kick_clip_count = 0
+        if KICK_ENABLED:
+            kick_streamers = ai_streamers + ai_related if (ai_streamers or ai_related) else streamers
+            for ks in kick_streamers[:4]:  # limit to 4 streamers to avoid slowdown
+                try:
+                    kick_clips = fetch_kick_clips(ks, count=3)
+                    if kick_clips:
+                        clip_urls.extend(kick_clips)
+                        kick_clip_count += len(kick_clips)
+                except Exception as exc:
+                    log.warning("Kick fetch for '%s' failed (non-blocking): %s", ks, exc)
+            if kick_clip_count:
+                log.info("Got %d additional clips from Kick.com", kick_clip_count)
+
         # Last resort: fall back to random DEFAULT_STREAMERS
         if len(clip_urls) < 3:
             fallback = random.sample(DEFAULT_STREAMERS, min(4, len(DEFAULT_STREAMERS)))
@@ -2611,7 +2994,8 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
             clip_urls.extend(fetch_clip_urls(fallback, count=3))
 
         results["steps"]["clips"] = {"status": "ok", "count": len(clip_urls),
-                                     "sources": ai_streamers or streamers}
+                                     "sources": ai_streamers or streamers,
+                                     "kick_clips": kick_clip_count}
     except Exception as e:
         err = f"Clip fetch failed: {_sanitize(str(e))}"
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
@@ -2643,6 +3027,18 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
         short_title = topic[:57] + "..." if len(topic) > 60 else topic
         results["steps"]["title"] = {"status": "fallback", "title": short_title}
         log.warning("Title generation failed, using fallback: %s", e)
+
+    # Step 3c: Generate custom thumbnail (non-blocking)
+    thumbnail_path = None
+    try:
+        thumbnail_path = generate_thumbnail(video_path, hook_text)
+        if thumbnail_path:
+            results["steps"]["thumbnail"] = {"status": "ok", "path": str(thumbnail_path)}
+        else:
+            results["steps"]["thumbnail"] = {"status": "skipped", "reason": "generation returned None"}
+    except Exception as e:
+        results["steps"]["thumbnail"] = {"status": "skipped", "reason": str(e)[:100]}
+        log.warning("Thumbnail generation skipped: %s", e)
 
     # Step 4: Post to platforms (each independent — one failure doesn't block others)
     all_ok = True
@@ -2677,6 +3073,10 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
         try:
             video_id = upload_to_youtube(video_path, title=short_title, description=description)
             results["steps"]["youtube"] = {"status": "ok", "video_id": video_id}
+            # Upload custom thumbnail (non-blocking, best-effort)
+            if thumbnail_path and thumbnail_path.exists():
+                _set_youtube_thumbnail(video_id, thumbnail_path)
+                results["steps"]["youtube"]["thumbnail"] = "set"
             # Upload SRT captions (non-blocking, best-effort)
             if tts_boundaries:
                 _upload_youtube_captions(video_id, tts_boundaries)
