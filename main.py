@@ -422,6 +422,41 @@ def _send_notification(title: str, message: str, success: bool = True, details: 
         log.warning("Discord notification failed: %s", exc)
 
 
+def _send_draft_publish_reminder(title: str, publish_id: str = ""):
+    """Send a Discord notification that a TikTok draft needs manual publishing."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        fields = [
+            {"name": "Video", "value": (title[:150]) if title else "(untitled)", "inline": False},
+            {"name": "Action Required", "value": (
+                "1. Open TikTok app on your phone\n"
+                "2. Check notifications/inbox for the ClipLore upload\n"
+                "3. Review the video\n"
+                "4. Set privacy to **Public**\n"
+                "5. Tap **Post**"
+            ), "inline": False},
+        ]
+        if publish_id:
+            fields.append({"name": "Publish ID", "value": f"`{publish_id}`", "inline": True})
+        fields.append({"name": "Why?", "value": "TikTok app is not yet audited -- videos go to drafts instead of publishing directly. This goes away after audit approval.", "inline": False})
+
+        payload = {
+            "username": "ClipLoreTV",
+            "embeds": [{
+                "title": "TikTok Draft Ready -- Publish From Your Phone",
+                "description": "A new video was uploaded to your TikTok drafts and needs manual publishing.",
+                "color": 0xFF0050,
+                "fields": fields[:25],
+                "footer": {"text": "ClipLoreTV Pipeline"},
+            }]
+        }
+        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        log.info("Draft publish reminder sent to Discord for: %s", title[:60])
+    except Exception as exc:
+        log.warning("Draft publish reminder failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Request hooks
 # ---------------------------------------------------------------------------
@@ -1371,8 +1406,8 @@ def _cloud_encode(video_path: Path, ass_path: Path, hook_text: str, output_path:
     return output_path
 
 
-def upload_to_tiktok(video_path: Path, access_token: str, description: str = "") -> str:
-    """Upload video to TikTok. Returns publish_id."""
+def upload_to_tiktok(video_path: Path, access_token: str, description: str = "") -> tuple[str, bool]:
+    """Upload video to TikTok. Returns (publish_id, used_inbox)."""
     file_size = video_path.stat().st_size
     if file_size > 50 * 1024 * 1024:
         raise ValueError("Video too large (max 50 MB)")
@@ -1430,6 +1465,7 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
 
     upload_url = init_data["data"]["upload_url"]
     publish_id = init_data["data"]["publish_id"]
+    used_inbox = "inbox" in endpoint
 
     video_bytes = video_path.read_bytes()
     requests.put(
@@ -1442,7 +1478,7 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
         timeout=120,
     ).raise_for_status()
 
-    return publish_id
+    return publish_id, used_inbox
 
 
 def _get_youtube_credentials():
@@ -2819,11 +2855,14 @@ def post_to_tiktok_endpoint():
         return jsonify({"error": "Video file not found"}), 404
 
     try:
-        publish_id = upload_to_tiktok(video_file, access_token, description)
+        publish_id, used_inbox = upload_to_tiktok(video_file, access_token, description)
+        if used_inbox and DISCORD_WEBHOOK_URL:
+            _send_draft_publish_reminder(description, publish_id)
         return jsonify({
             "publish_id": publish_id,
             "status": "uploaded",
-            "message": "Video uploaded to TikTok. Check Creator Center for processing status.",
+            "used_inbox": used_inbox,
+            "message": "Video sent to TikTok drafts -- publish manually from the app." if used_inbox else "Video published to TikTok.",
         })
     except Exception as e:
         return jsonify({"error": f"TikTok API error: {_sanitize(str(e))}"}), 502
@@ -3061,8 +3100,10 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     # 4a: TikTok
     if tiktok_token:
         try:
-            publish_id = upload_to_tiktok(video_path, tiktok_token, description)
-            results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id}
+            publish_id, used_inbox = upload_to_tiktok(video_path, tiktok_token, description)
+            results["steps"]["tiktok"] = {"status": "ok", "publish_id": publish_id, "used_inbox": used_inbox}
+            if used_inbox and DISCORD_WEBHOOK_URL:
+                _send_draft_publish_reminder(description, publish_id)
         except Exception as e:
             results["steps"]["tiktok"] = {"status": "error", "error": _sanitize(str(e))}
             all_ok = False
@@ -3111,6 +3152,34 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
 
     platforms = {k: v.get("status") for k, v in results["steps"].items() if k in ("tiktok", "youtube", "instagram")}
     log.info("Pipeline done: topic=%s platforms=%s", topic[:50], platforms)
+
+    # Send finished video to Discord for manual TikTok posting
+    if DISCORD_WEBHOOK_URL and video_path and video_path.exists():
+        try:
+            file_size = video_path.stat().st_size
+            if file_size < 25 * 1024 * 1024:  # Discord 25MB limit
+                yt_id = results.get("steps", {}).get("youtube", {}).get("video_id", "")
+                yt_link = f"https://youtube.com/shorts/{yt_id}" if yt_id else "N/A"
+                msg = (
+                    f"**New ClipLore Video Ready**\n"
+                    f"**Title:** {short_title}\n"
+                    f"**Topic:** {topic[:100]}\n"
+                    f"**YouTube:** {yt_link}\n"
+                    f"**TikTok:** {'Drafts (publish manually)' if results.get('steps',{}).get('tiktok',{}).get('used_inbox') else results.get('steps',{}).get('tiktok',{}).get('status','skipped')}\n\n"
+                    f"Download the video below and upload at https://www.tiktok.com/creator"
+                )
+                with open(video_path, "rb") as vf:
+                    requests.post(
+                        DISCORD_WEBHOOK_URL,
+                        data={"content": msg},
+                        files={"file": (f"cliplore_{short_title[:30].replace(' ','_')}.mp4", vf, "video/mp4")},
+                        timeout=120,
+                    )
+                log.info("Video sent to Discord for manual TikTok posting")
+            else:
+                log.warning("Video too large for Discord (%d MB), skipping attachment", file_size // (1024*1024))
+        except Exception as e:
+            log.warning("Failed to send video to Discord: %s", e)
 
     # Store last result for /status endpoint
     _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
