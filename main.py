@@ -1391,7 +1391,7 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
             json={
                 "post_info": {
                     "title": (description[:150]) if description else "ClipLoreTV",
-                    "privacy_level": "SELF_ONLY",
+                    "privacy_level": "PUBLIC_TO_EVERYONE",
                     "disable_duet": False,
                     "disable_comment": False,
                     "disable_stitch": False,
@@ -1409,8 +1409,10 @@ def upload_to_tiktok(video_path: Path, access_token: str, description: str = "")
                  endpoint.split("/")[-3], init_resp.status_code, init_resp.text[:500])
 
         if init_resp.status_code == 403 and "inbox" not in endpoint:
-            log.warning("Direct publish returned 403, trying inbox/draft endpoint")
+            log.warning("Direct publish returned 403 (unaudited app), trying inbox/draft endpoint. NOTE: Inbox videos go to drafts — user must manually publish from TikTok app.")
             continue
+        if "inbox" in endpoint:
+            log.warning("Using INBOX endpoint — video will appear in TikTok drafts, NOT published publicly. To fix: get TikTok app audited for direct publish scope.")
         break
 
     if init_resp.status_code != 200:
