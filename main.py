@@ -3153,33 +3153,32 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
     platforms = {k: v.get("status") for k, v in results["steps"].items() if k in ("tiktok", "youtube", "instagram")}
     log.info("Pipeline done: topic=%s platforms=%s", topic[:50], platforms)
 
-    # Send finished video to Discord for manual TikTok posting
-    if DISCORD_WEBHOOK_URL and video_path and video_path.exists():
+    # Ping Discord with caption to copy-paste when TikTok draft is ready
+    if DISCORD_WEBHOOK_URL:
         try:
-            file_size = video_path.stat().st_size
-            if file_size < 25 * 1024 * 1024:  # Discord 25MB limit
-                yt_id = results.get("steps", {}).get("youtube", {}).get("video_id", "")
-                yt_link = f"https://youtube.com/shorts/{yt_id}" if yt_id else "N/A"
+            yt_id = results.get("steps", {}).get("youtube", {}).get("video_id", "")
+            yt_link = f"https://youtube.com/shorts/{yt_id}" if yt_id else ""
+            tiktok_status = results.get("steps", {}).get("tiktok", {})
+            used_inbox = tiktok_status.get("used_inbox", False)
+
+            if used_inbox:
                 msg = (
-                    f"**New ClipLore Video Ready**\n"
-                    f"**Title:** {short_title}\n"
-                    f"**Topic:** {topic[:100]}\n"
-                    f"**YouTube:** {yt_link}\n"
-                    f"**TikTok:** {'Drafts (publish manually)' if results.get('steps',{}).get('tiktok',{}).get('used_inbox') else results.get('steps',{}).get('tiktok',{}).get('status','skipped')}\n\n"
-                    f"Download the video below and upload at https://www.tiktok.com/creator"
+                    f"**ClipLore video ready in TikTok drafts**\n\n"
+                    f"Check your TikTok notifications, tap to open, paste this caption:\n\n"
+                    f"```\n{description}\n```\n\n"
+                    f"Set to **Public** and hit Post."
                 )
-                with open(video_path, "rb") as vf:
-                    requests.post(
-                        DISCORD_WEBHOOK_URL,
-                        data={"content": msg},
-                        files={"file": (f"cliplore_{short_title[:30].replace(' ','_')}.mp4", vf, "video/mp4")},
-                        timeout=120,
-                    )
-                log.info("Video sent to Discord for manual TikTok posting")
             else:
-                log.warning("Video too large for Discord (%d MB), skipping attachment", file_size // (1024*1024))
+                msg = (
+                    f"**ClipLore video published**\n"
+                    f"**Title:** {short_title}\n"
+                    f"{'**YouTube:** ' + yt_link if yt_link else ''}"
+                )
+
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
+            log.info("Discord notification sent (inbox=%s)", used_inbox)
         except Exception as e:
-            log.warning("Failed to send video to Discord: %s", e)
+            log.warning("Failed to send Discord notification: %s", e)
 
     # Store last result for /status endpoint
     _last_pipeline_result["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
