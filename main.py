@@ -627,6 +627,51 @@ def generate_script_text(topic: str, pillar: str = "") -> str:
     return script
 
 
+def generate_short_title(topic: str, script_text: str = "") -> str:
+    """Generate a Shorts-optimized title using AI. Falls back to topic truncation."""
+    prompt = (
+        f"Write a YouTube Shorts / TikTok title for this video topic:\n\n"
+        f"Topic: {topic}\n"
+        + (f"Script preview: {clean_script(script_text)[:200]}\n\n" if script_text else "\n")
+        + "STRICT RULES:\n"
+        "1. Front-load a searchable noun (streamer name, game name, platform name) in the FIRST 3 WORDS\n"
+        "2. Title MUST be under 60 characters total\n"
+        "3. Include an emotional hook word: a number, or words like failed, banned, destroyed, exposed, broke, lost, caught, ruined\n"
+        "4. NO editorial phrasing like 'the real reason', 'a tier list of', 'let me explain', 'here is why'\n"
+        "5. Format: '[Name/Thing] [shocking verb] [consequence] — [curiosity hook]'\n\n"
+        "GOOD examples:\n"
+        "- Ninja got $30M and still failed — here's why\n"
+        "- These streamers got banned and deserved it\n"
+        "- xQc broke Twitch's biggest rule and nothing happened\n"
+        "- Pokimane exposed the truth about streaming money\n"
+        "- Asmongold destroyed this game's reputation in 1 stream\n\n"
+        "BAD examples (DO NOT write like these):\n"
+        "- The real reason streaming is dying\n"
+        "- A tier list of the best Twitch moments\n"
+        "- Here's what nobody talks about in gaming\n\n"
+        "Return ONLY the title text. Nothing else. No quotes, no explanation."
+    )
+    try:
+        raw_title = _call_gemini(prompt) or _call_claude(prompt)
+        if raw_title:
+            # Clean up: strip quotes, whitespace, ensure length
+            title = raw_title.strip().strip('"').strip("'").strip()
+            # Remove any trailing hashtags the AI might add
+            title = re.sub(r'\s*#\w+', '', title).strip()
+            if len(title) > 60:
+                title = title[:57] + "..."
+            if len(title) > 10:
+                log.info("Generated Shorts title: %s", title)
+                return title
+    except Exception as exc:
+        log.warning("Title generation failed: %s", exc)
+
+    # Fallback: truncate topic to 60 chars
+    fallback = topic[:57] + "..." if len(topic) > 60 else topic
+    log.info("Using fallback title: %s", fallback)
+    return fallback
+
+
 def clean_script(raw: str) -> str:
     """Strip [VISUAL], [PAUSE], [HOOK], etc. tags and markdown from a script."""
     text = re.sub(r"\[VISUAL[^\]]*\]", "", raw)   # [VISUAL: ...] and [VISUAL]
@@ -1128,14 +1173,23 @@ def assemble_video_from_parts(script_text: str, clip_urls: list, topic: str = ""
         try:
             vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
 
-            # Add hook text overlay on the first clip (first 3 seconds)
+            # Add bold hook text overlay on the first clip (first 3 seconds)
+            # This is the retention hook — big, centered, impossible to miss
             if i == 0 and hook_text:
+                # Word-wrap long hooks: split into 2 lines if over 35 chars
                 safe_hook = hook_text[:80].replace("'", "").replace(":", " -").replace("\\", "").replace("%", "%%")
+                if len(safe_hook) > 35:
+                    # Split at nearest space to midpoint
+                    mid = len(safe_hook) // 2
+                    space_idx = safe_hook.rfind(" ", 0, mid + 10)
+                    if space_idx > 10:
+                        safe_hook = safe_hook[:space_idx] + "\n" + safe_hook[space_idx + 1:]
+
                 vf += (
                     f",drawtext=text='{safe_hook}':"
-                    "fontsize=36:fontcolor=white:borderw=3:bordercolor=black:"
-                    "box=1:boxborderw=8:boxcolor=black@0.6:"
-                    "x=(w-text_w)/2:y=h*0.15:"
+                    "fontsize=48:fontcolor=white:borderw=4:bordercolor=black:"
+                    "box=1:boxborderw=14:boxcolor=black@0.7:"
+                    "x=(w-text_w)/2:y=(h-text_h)/2:"
                     "enable='between(t,0,3)'"
                 )
 
@@ -1403,11 +1457,27 @@ def upload_to_youtube(video_path: Path, title: str = "", description: str = "") 
         raise ValueError("YouTube not authenticated. Visit /youtube/auth first.")
 
     youtube = build("youtube", "v3", credentials=creds)
+
+    # Ensure title fits YouTube Shorts requirements (under 100 chars)
+    yt_title = (title[:100]) if title else "ClipLoreTV #Shorts"
+
+    # CRITICAL: #Shorts MUST be in the description for YouTube to classify as a Short.
+    # Also add gaming hashtags for discoverability.
+    shorts_tags = "#Shorts #twitch #gaming #streamer #cliploretv"
+    if description:
+        # Prepend #Shorts if not already present (case-insensitive check)
+        if "#shorts" not in description.lower():
+            yt_description = f"{description}\n\n{shorts_tags}"
+        else:
+            yt_description = description
+    else:
+        yt_description = shorts_tags
+
     body = {
         "snippet": {
-            "title": (title[:100]) if title else "ClipLoreTV #Shorts",
-            "description": description or "#twitch #gaming #shorts #cliploretv",
-            "tags": ["twitch", "gaming", "shorts", "cliploretv"],
+            "title": yt_title,
+            "description": yt_description,
+            "tags": ["Shorts", "twitch", "gaming", "shorts", "cliploretv", "streamer", "twitchclips"],
             "categoryId": "20",  # Gaming
         },
         "status": {
@@ -2565,9 +2635,17 @@ def _run_pipeline(topic, pillar, streamers, tiktok_token, description, skip_uplo
         _send_notification("❌ Pipeline Failed", err, success=False, details={"topic": topic})
         return _err_response(err)
 
+    # Step 3b: Generate optimized Shorts title
+    try:
+        short_title = generate_short_title(topic, script_text)
+        results["steps"]["title"] = {"status": "ok", "title": short_title}
+    except Exception as e:
+        short_title = topic[:57] + "..." if len(topic) > 60 else topic
+        results["steps"]["title"] = {"status": "fallback", "title": short_title}
+        log.warning("Title generation failed, using fallback: %s", e)
+
     # Step 4: Post to platforms (each independent — one failure doesn't block others)
     all_ok = True
-    short_title = topic[:100] if topic else "ClipLoreTV"
 
     if skip_upload:
         results["steps"]["tiktok"] = {"status": "skipped", "reason": "test_only mode"}
